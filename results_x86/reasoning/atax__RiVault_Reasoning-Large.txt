@@ -1,0 +1,447 @@
+We need to write an inline asm block replacing the scop region. DATA_TYPE is typically double in atax (polybench default is double). The kernel:
+
+for i in 0..N: y[i]=0;
+for i in 0..M:
+  tmp[i]=0;
+  for j: tmp[i] += A[i][j]*x[j];
+  for j: y[j] += A[i][j]*tmp[i];
+
+We need registers for m, n, pointers A, x, y, tmp, loop counters i, j, and a float accumulator.
+
+Inputs: _PB_M, _PB_N scalars (m, n args). Actually inside function, references use _PB_M and _PB_N which are macros for m and n (with polybench, _PB_M is m). So use m and n as int inputs.
+
+Write asm:
+
+double* A, x, y, tmp as inputs (pointers).
+
+Plan:
+- zero y: loop over n.
+- loop i over m:
+  - tmp[i] = 0; acc=0; loop j over n: acc += A[i*n+j]*x[j]; tmp[i]=acc;
+  - load ti = tmp[i]; loop j: y[j] += A[i*n+j]*ti;
+
+Registers:
+- r8: A ptr, r9: x, r10: y, r11: tmp
+- rdi (m count via input "m"), but careful: asm uses input constraints. Use "r" inputs and let compiler assign. Safer: use explicit registers via local register variables? We can just use general constraints and clobbers for all used registers. But requirement says don't clobber registers still needed. We can list clobbered registers explicitly. However outputs: none except memory. We can mark inputs as memory pointers with "r" constraint and clobber regs we use. Since inputs are read, and we clobber other regs, fine. But pointer inputs might be assigned to registers we clobber — GCC knows input regs are read before clobbered uses... actually clobbers and inputs: GCC will not assign an input to a clobbered register? It treats "r" inputs as regs that may be clobbered? Actually GCC assumes inputs are consumed before any clobber; if we use input reg at various points, that's our responsibility. GCC may allocate input to a clobbered register — that's allowed if GCC handles it by copying? No — GCC may use a register for an input operand and also clobber it; that's an error ("invalid 'asm': clobbered register would be clobbered... " actually GCC detects conflict inputs/clobbers: "asm operand has impossible constraints" no... GCC gives error: "clobbered register overlaps with input operand"? It raises error "bad register name" no. GCC does check for conflicts between clobbers and input/output operands and will error ("clobber list conflicts"). Actually GCC gives error: "asm-specifier for variable ... conflicts with asm clobber list" for register variables; for normal operands, GCC errors with "clobber conflicts with operand"? I believe modern GCC errors: "invalid 'asm': operand with... " Hmm. Safe approach: use explicit register variables for inputs, and choose distinct clobbered working registers.
+
+Since we don't know DATA_TYPE for sure — default polybench atax.c DATA_TYPE is double (with FLOAT only when compiled with -DFLOAT... actually polybench default DATA_TYPE is double; atax defines DATA_TYPE double by default). Use double (movsd, mulsd, addsd). But scalar expansion off; fine.
+
+Simplest robust approach: use local register variables:
+
+#define nothing... we just write code:
+
+{
+  double *Ap = A, *xp = x, *yp = y, *tp = tmp;
+  long N = n, M = m;
+  asm volatile(... )
+}
+
+Better: write asm with explicit register-bound variables:
+
+register const double *Aptr asm("r8") = A; etc. That guarantees assignment.
+
+Let me allocate:
+
+- r8: A base pointer (constant)
+- r9: x base
+- r10: y base
+- r11: tmp base
+- rsi: row pointer A + i*N (advances each i)
+- rdi: column pointer within row (advances each j)
+- rax: j counter
+- rcx: i counter
+- rbx: n (64-bit)
+- xmm0: acc, xmm1: tmp[i] value, xmm2: A element
+
+Loop 1: zero y.
+ rbx = n (sign-extended from int input "m"? use "r"(&?) input as int n, then movslq). Let's take inputs: "r"(m) into some reg? With register variables: 
+
+register int m_in asm("eax") = m; — careful mixing. Simpler: pass m and n as memory inputs? Memory input constraint "m" for ints requires them stored in memory—they are function args on stack or regs; "m" constraint would handle. Actually operands m and n as int values: use constraint "r" and then movslq inside, but GCC won't guarantee which register; but we clobber lots of registers — conflict risk if input assigned to clobbered reg. GCC handles input-clobber conflict? Historically GCC allows inputs in clobbered regs and assumes you read them before clobbering (documented: it's fine as long as you don't write to them). Since we read n/m at block start, that's fine. But GCC might reuse that reg... Actually known rule: "Do not modify the contents of input-only operands... its register may be used for anything" — it's undefined to write input operands. Since we only read them at the top before writing anything (except via clobbers which we also write) — risk if input is in a reg that we clobber before reading. If we read at top first, fine.
+
+Safer clean approach: bind inputs to specific registers with register-asm locals, choose registers, and then explicitly clobber those plus working registers? Register variables bound to fixed regs: we need to clobber them since we modify. GCC rules: if you bind a variable to a register with asm and modify it inside asm, you must list it in clobber list... but then the operand conflicts. The typical trick: use them as inputs and clobber them — GCC errors? Let me recall: GCC errors when a clobbered register coincides with an input operand register in explicit form like asm("r8")? With register variables, GCC will complain "clobber conflict" ... Actually I recall common pattern:
+
+register long rax asm("rax");
+asm volatile("..." : "+r"(rax) : ...);
+
+Using local register variables with explicit register names, then declaring them as "+r" outputs avoids clobber conflicts entirely! That's the robust technique: treat everything as in/out operands, no clobber list, plus "cc" and "memory" clobbers.
+
+So: define register locals for all regs we use, pass them as "+r" (read-write) inputs.
+
+Registers needed:
+- i counter: rcx? Let's pick: 
+  - rbx: n64 (initialized to n, read-only or keep) — could be "+r" but we don't change: use as input "r" (register var). But BB may clobber? No, we control code.
+  - Using register variables pinned to specific regs means compiler must handle saving rbx etc. (callee-saved) itself. 
+
+List:
+  - A base: r8
+  - x base: r9
+  - y base: r10
+  - tmp base: r11
+  - row ptr (A + i*n): r14
+  - col ptr: r15
+  - j counter: rax
+  - i counter: rcx? but also need n64... use rbx for n, rsi for i counter.
+  - xmm0: acc
+  - xmm1: tmp value
+  - xmm2: a elem
+
+Also need m64: derive from i loop compare: compare rcx with m. Use r12? We have rdx, rdi, rsi, rbp free. Let's use rdi as m64, rsi as i counter.
+
+Both loops need j counter and col pointer: rax (j counter) and r15 (col ptr). For loop over y zeroing: need y ptr — use r10 directly with index y[j], via rax*8.
+
+Details per loop:
+
+Zero y:
+  xorl eax, eax? but rax is register var initialized to j=0 — we need it 0; set inside asm: "movl $0, eax" or xor eax,eax.
+  Loop: test rax vs rbx (n64); if >= n break; movsd zero? Store 0.0: use xorps xmm0,xmm0; movsd [r10+rax*8], xmm0. But xmm0 is acc used later—fine reuse.
+  inc rax; jnz label... Actually loop: 
+  Lzero: cmp rax, rbx; jge Lzero_end; xorps xmm0,xmm0; movsd (r10,rax,8), xmm0; inc rax; jmp Lzero.
+
+Main loop i:
+  Louter: cmp rsi, rdi (i vs m); jge Lend.
+  tmp[i]=... via accumulate then store.
+  xorl eax,eax (j=0); xorps xmm0,xmm0 (acc).
+  Linner1: cmp rax, rbx; jge Linner1_end; movsd xmm2, (r14,rax,8); mulsd xmm2, (r9,rax,8); addsd xmm0, xmm2; inc rax; jmp Linner1.
+  Linner1_end: movsd (r11,rsi,8), xmm0; store tmp[i].
+  movsd xmm1, xmm0; (tmp[i] in xmm1)
+  xorl eax,eax.
+  Linner2: cmp rax, rbx; jge Linner2_end; movsd xmm2, (r14,rax,8); mulsd xmm2, xmm1; addsd xmm2, (r10,rax,8); movsd (r10,rax,8), xmm2; inc rax; jmp Linner2.
+  Linner2_end: add $1, rsi; addq n64*8 to r14 → add rbx Copy n into rbx*8: "leaq (0,rbx,8), rdx" then add rdx to r14. Or precompute n64*8 into a spare reg: use rdx as n8 (n*8), constant; set once at top: leaq (,rbx,8), rdx — wait syntax: leaq (%rbx,%rbx,8)? No: n*8 = rbx<<3: "leaq (,%%rbx,8), %%rdx" wait scale with no base: leaq (,rbx,8), rdx valid in AT&T: leaq 0(,%%rbx,8), %%rdx. Fine.
+  jmp Louter.
+
+Register vars to declare: since GCC must save callee-saved rbx, r12..r15, that's automatic with local register vars? Yes, GCC handles saving/reloading callee-saved registers when used by local register variables. Hmm, does it? Local register variables: "don't expect the value to persist" but the register itself is treated like a used register for prologue purposes? I believe local register variables do make GCC save/restore callee-saved regs. Yes — declaring `register int x asm("rbx")` makes GCC treat rbx as live, saving it in prologue. That works in practice.
+
+But note: local register variables with asm specifier — GCC requires the asm to be at declaration, at function scope block. This is inside kernel_atax. But note the requirement says replace only code between pragma markers; we can add declarations there.
+
+Potential issue: register variables give error "register specified for '%a', isn't suitable for data type" only if wrong width. Fine.
+
+Also declare inline asm operands:
+
+asm volatile (
+  code
+  : "+r"(rcx /*i*/), "+r"(rcx...)... 
+
+Let's list register variables:
+
+register long li asm("rsi") = 0;         // i
+register long lj asm("rax") = 0;         // j
+register long ln asm("rbx") = n;         // n64
+register long lm asm("rdi") = m;         // m64
+register long lne asm("rdx") = 0;        // n*8
+register const double *pA asm("r8") = A;
+register const double *pX asm("r9") = x;
+register double *pY asm("r10") = y;
+register double *pT asm("r11") = tmp;
+register const double *pRow asm("r14") = A;
+register const double *pCol asm("r15") = A;
+register double acc asm("xmm0") = 0.0;
+register double tv asm("xmm1") = 0.0;
+register double av asm("xmm2") = 0.0;
+
+Operand list: outputs "+r" for li, lj, lne (we modify rdx, rax, rsi, r15, r14...). pRow, pCol are modified: "+r". acc, tv, av: "+x". Inputs "r" : ln, lm, pA, pX, pY, pT — these aren't modified (pY, pT, pA, pX read-only). But wait — pY used as base with index rax: [r10+rax*8], fine.
+
+Clobbers: "memory" (writes to y, tmp via memory, and A,x are inputs to memory too — but reads fine). "cc".
+
+Note aliasing concern: A and y could theoretically overlap? In polybench they don't. memory clobber safest.
+
+n64*8 computed: leaq (,%%rbx,8), %%rdx — but rdx is "+r" output starting 0; we compute inside. Good.
+
+Also must sign-extend n and m: they're ints; register var `register long ln asm("rbx") = n;` implicitly converts int to long, sign extended by compiler. Good.
+
+Cardinal note: M and N — with default polybench, kernel operates on m×n values. We use m and n (function args). _PB_M/_PB_N equal m/n. Good.
+
+Code:
+
+Lz:
+  cmpq %%rbx, %%rax — careful: compare rax vs rbx: "cmpq %%rbx, %%rax; jge" → computes rax - rbx; jge taken if rax>=rbx → exit. Good.
+
+Write:
+
+        xorl %%eax, %%eax
+1:      cmpq %%rbx, %%rax
+        jge 2f
+        xorps %%xmm0, %%xmm0
+        movsd %%xmm0, (%%r10,%%rax,8)
+        incq %%rax
+        jmp 1b
+2:
+        xorl %%esi, %%esi
+3:      cmpq %%rdi, %%rsi
+        jge 7f
+        xorl %%eax, %%eax
+        xorps %%xmm0, %%xmm0
+4:      cmpq %%rbx, %%rax
+        jge 5f
+        movsd (%%r14,%%rax,8), %%xmm2
+        mulsd (%%r9,%%rax,8), %%xmm2
+        addsd %%xmm2, %%xmm0
+        incq %%rax
+        jmp 4b
+5:      movsd %%xmm0, (%%r11,%%rsi,8)
+        movaps %%xmm0, %%xmm1
+        xorl %%eax, %%eax
+6:      cmpq %%rbx, %%rax
+        jge 51f
+        movsd (%%r14,%%rax,8), %%xmm2
+        mulsd %%xmm1, %%xmm2
+        addsd %%xmm2, (%%r10,%%rax,8)
+        incq %%rax
+        jmp 6b
+51:
+        addq %%rdx, %%r14
+        incq %%rsi
+        jmp 3b
+7:
+
+Wait, addq %%rdx to r14, but rdx = n*8 — but for the second inner loop, "addsd %%xmm2, mem" is allowed (SDSA: addsd has memory destination form yes). Fine.
+
+Numeric local labels: use numeric labels with f/b suffixes, fine. But careful with `51` label confusion: use 50/ 6 etc. I used 51 — fine (labels can be arbitrary numbers with GNU as? local labels 0-9 only traditionally, but `\d+:` numeric local labels any digits allowed now in GAS? Numeric labels beyond 9 are allowed in modern gas? Actually GAS supports local labels 0-9 only per docs ("Local labels are defined as 0-9"). Labels 10+ would be global symbols? Numeric labels >9: GAS treats them as labels but f/b references... I think GAS allows any numeric local label digit sequences? The docs say local labels 0-9. Hmm, actually objdump shows things like "51:"? To be safe use only labels 0-9.
+
+Renumber:
+0: zero loop; 1: exit; 2: outer; 3: outer-end answer... let me redo:
+
+      xorl %%eax, %%eax
+0:    cmpq %%rbx, %%rax
+      jge 1f
+      xorps %%xmm0, %%xmm0
+      movsd %%xmm0, (%%r10,%%rax,8)
+      incq %%rax
+      jmp 0b
+1:
+      xorl %%esi, %%esi
+2:    cmpq %%rdi, %%rsi
+      jge 6f
+      xorl %%eax, %%eax
+      xorps %%xmm0, %%xmm0
+3:    cmpq %%rbx, %%rax
+      jge 4f
+      movsd (%%r14,%%rax,8), %%xmm2
+      mulsd (%%r9,%%rax,8), %%xmm2
+      addsd %%xmm2, %%xmm0
+      incq %%rax
+      jmp 3b
+4:    movsd %%xmm0, (%%r11,%%rsi,8)
+      movaps %%xmm0, %%xmm1
+      xorl %%eax, %%eax
+5:    cmpq %%rbx, %%rax
+      jge 51f -> problem. Use falls through: reorder so that label 6 region:
+
+Alternative: make loop 5 exit jump to 7? Then outer increments at 7? But 7 also needs to not conflict... Let me restructure: after inner loop 5 exits (jge 5f where 5 is next label?). Use:
+
+5:    ... jmp 5b ; exit: jge 6f
+6:    addq %%rdx, %%r14
+      incq %%rsi
+      jmp 2b
+
+Wait then labels: outer checks `jge 6f` earlier — conflict because 6 is the tail. Fix: outer compare should jump to 7f where 7 is end.
+
+Sequence:
+0: y-zero loop
+1: after
+2: outer head; cmp; jge 7f
+3: inner1; jge 4f
+4: store tmp; movaps; xor; 
+5: inner2 loop; jge 6f
+6: tail: add r14; inc rsi; jmp 2b
+7: end
+
+Wait 6 is the tail that follows loop 5; loop 5 exit jumps to 6f — but 6 defined right after, fine. And outer jumps to 7f at end. 
+
+But careful: label numbers 0..9 all fine.
+
+Now operand lists:
+
+Outputs ("+r"/"+x"): li(rsi), lj(rax), lne(rdx), pRow(r14), pCol(r15)? I don't actually use r15 in code — drop it. pRow "+r". acc, tv, av as "+x".
+
+Inputs: ln(rbx) "r", lm(rdi) "r", pA "r"(A) — but pinned register variables: just pass them as inputs "r"? If declared with asm register binding, using them as asm operands with constraint "r" keeps binding. For inputs use "r" constraint (GCC will use the bound register). Good.
+
+Wait: register vars must be used as asm operands for the binding to be honored. Yes we do.
+
+Also gcc 4.9+ requirement fine.
+
+Clobber "memory", "cc"? With explicit flag usage? We use jge etc. but no flag operands declared — we must clobber "cc". Yes add "cc".
+
+x87? no.
+
+One more check: does `register const double *pA asm("r8") = A;` with A of type `double (*)[N]`? A is declared as DATA_TYPE POLYBENCH_2D(A,M,N,m,n) which expands to double (*A)[N][N] (static-size arrays macro: A is pointer to array). In kernel, A[i][j] indexing. To pass pointer, cast: (const double *)A. x is `double (*x)[N]` similarly. So in register var declarations, cast: `= (const double *)A`. pX = (const double*)x; pY = (double*)y; pT = (double*)tmp; pRow initial = (const double*)A.
+
+Pointer register vars: binding pointer to register is fine.
+
+Also note tv: unused? tv = tmp[i] used in loop2. Keep.
+
+Also we compute element uses doubles; DATA_TYPE default double. Some polybench variants use DATA_TYPE float? The file uses SCALAR_VAL(0.0) and DATA_PRINTF_MODIFIER; default is double. Answer with double.
+
+Edge: m=0 or n=0: loops handle.
+
+movsd %%xmm0, (%%r10,%%rax,8) — AT&T memory operand for base+index*scale needs displacement maybe: movsd %%xmm0, (%%r10,%%rax,8) valid.
+
+Also "movaps %%xmm0, %%xmm1" fine, or movsd.
+
+Potential warning: unused variable tv? used. lne uses.
+
+Assemble the asm string with layout; include AT&T escape of %%.
+
+Also add note about "memory" clobber sufficient for A reads? A is input read via memory pointers; asm reads memory not declared as input operand → compiler could theoretically reorder stores before asm that modify A/x? Within function nothing modifies them, but to be safe, passing pointers as inputs with "m"? Using "memory" clobber prevents moving stores across; also could list A and x as memory inputs? Simpler: the memory clobber applies to outputs; reads still need input declaration. Could add dummy: asm volatile with pointers as "r" inputs — the pointer values are inputs; the pointed-to memory read isn't declared. In practice fine (volatile asm not deleted; memory clobber blocks reordering of stores). Acceptable.
+
+Now, the register var declarations: they must be in scope; note local register variables can't have initializer? They can: "register int x asm("r8") = value;" allowed.
+
+However, an important subtlety: when using local register variables as asm operands, GCC doesn't guarantee callee-saved save? Docs: "the compiler assumes that these registers... " For callee-saved registers like rbx, GCC will save them since register is treated as globally allocated within the function? Documented behavior: "Do not expect values to persist between consecutive asm statements" but register allocation considers them live yes—GCC does save callee-saved registers when local register variables are used. This is standard practice in the Linux kernel. OK.
+
+But r8-r15: r12-r15 callee-saved; we use r14 only (pRow). GCC saves it. r8-r11, rax, rcx, rdx, rsi, rdi caller-saved — fine.
+
+We don't use rcx. Fine.
+
+Note using xmm regs as operands: constraint "+x".
+
+Double typeof: declare as double.
+
+Write final declarations inside a block within the scop region? The scop region is inside the function body; the surrounding function already declares int i, j (unused after replacement — that's fine, maybe warning unused). We replace lines between pragmas with our block.
+
+Code:
+
+  {
+    register long i asm("rsi") = 0;
+    register long j asm("rax") = 0;
+    register long n64 asm("rbx") = (long)n;
+    register long m64 asm("rdi") = (long)m;
+    register long n8 asm("rdx") = 0;
+    register const double *a asm("r8") = (const double *)A;
+    register const double *xx asm("r9") = (const double *)x;
+    register double *yy asm("r10") = (double *)y;
+    register double *tt asm("r11") = (double *)tmp;
+    register const double *arow asm("r14") = (const double *)A;
+    register double acc asm("xmm0") = 0.0;
+    register double tv asm("xmm1") = 0.0;
+    register double av asm("xmm2") = 0.0;
+
+    __asm__ __volatile__ (
+      "xorl %%eax, %%eax\n\t"
+      "0:\n\t"...
+
+Operand list: outputs: "+r"(i), "+r"(j), "+r"(n8), "+r"(arow), "+x"(acc), "+x"(tv), "+x"(av); inputs: "r"(n64), "r"(m64), "r"(a), "r"(xx), "r"(yy), "r"(tt); clobbers: "memory", "cc".
+
+Wait conflict: outputs bound to rsi, rax, rdx, r14, xmm0-2; inputs bound to rbx, rdi, r8-r11 — no overlaps. 
+
+Also variables a, xx, yy, tt unused otherwise—but used in asm so fine; GCC might warn "unused variable" if asm fails, ok.
+
+One catch: register variable `register const double *a asm("r8") = (const double *)A;` "const" pointer—GCC might complain asm-specifier on qualified? Fine.
+
+Hmm — the "%rbx" conflict: rbx callee-saved, GCC saves. But: local register variable bound to rbx passed as input "r" — as long as it's used as operand, GCC handles.
+
+Also unused i, j int declarations already in function: still used? no. Not a problem.
+
+Also n8 output "+r" and never read before write — reads of uninitialized output value fine.
+
+One subtlety: register var initialization reading function params — compiler sets registers. Good.
+
+Also `movsd %%xmm0, (%%r10,%%rax,8)` — need `movsd` store from xmm; correct mnemonic movsd (SSE2). Yes.
+
+`addsd %%xmm2, (%%r10,%%rax,8)` — valid form (addsd xmm, m64). Yes.
+
+Assemble string. Use named labels? Feedback constraint only on inputs to outputs—we don't feed outputs back as inputs, so fine.
+
+Check the inner2 add: y[j] = y[j] + A[i][j]*tmp[i]: xmm2 = A; xmm2*=tv; add to y. Good.
+
+Also must handle endian of `(%%r11,%%rsi,8)` tmp[i] store — correct.
+
+Final check on jumps referencing labels: numeric local labels with 0b/0f etc. In GAS, "0:" then "jmp 0b" works, "jge 1f" works.
+
+Write the asm text with escapes: in a single C string with \n\t or multiple adjacent strings. I'll craft with explicit "%%" escapes.
+
+Full asm block:
+
+```c
+  {
+    register long ri asm ("rsi") = 0;
+    register long rj asm ("rax") = 0;
+    register long rn asm ("rbx") = (long)n;
+    register long rm asm ("rdi") = (long)m;
+    register long rn8 asm ("rdx") = 0;
+    register const double *pA asm ("r8") = (const double *)A;
+    register const double *pX asm ("r9") = (const double *)x;
+    register double *pY asm ("r10") = (double *)y;
+    register double *pT asm ("r11") = (double *)tmp;
+    register const double *pRow asm ("r14") = (const double *)A;
+    register double acc asm ("xmm0") = 0.0;
+    register double tval asm ("xmm1") = 0.0;
+    register double aval asm ("xmm2") = 0.0;
+
+    __asm__ __volatile__ (
+        "xorl %%eax, %%eax\n\t"
+        "0:\n\t"
+        "cmpq %%rbx, %%rax\n\t"
+        "jge 1f\n\t"
+        "xorps %%xmm0, %%xmm0\n\t"
+        "movsd %%xmm0, (%%r10,%%rax,8)\n\t"
+        "incq %%rax\n\t"
+        "jmp 0b\n"
+        "1:\n\t"
+        "xorl %%esi, %%esi\n\t"
+        "2:\n\t"
+        "cmpq %%rdi, %%rsi\n\t"
+        "jge 7f\n\t"
+        "xorl %%eax, %%eax\n\t"
+        "xorps %%xmm0, %%xmm0\n\t"
+        "3:\n\t"
+        "cmpq %%rbx, %%rax\n\t"
+        "jge 4f\n\t"
+        "movsd (%%r14,%%rax,8), %%xmm2\n\t"
+        "mulsd (%%r9,%%rax,8), %%xmm2\n\t"
+        "addsd %%xmm2, %%xmm0\n\t"
+        "incq %%rax\n\t"
+        "jmp 3b\n"
+        "4:\n\t"
+        "movsd %%xmm0, (%%r11,%%rsi,8)\n\t"
+        "movaps %%xmm0, %%xmm1\n\t"
+        "xorl %%eax, %%eax\n\t"
+        "5:\n\t"
+        "cmpq %%rbx, %%rax\n\t"
+        "jge 6f\n\t"
+        "movsd (%%r14,%%rax,8), %%xmm2\n\t"
+        "mulsd %%xmm1, %%xmm2\n\t"
+        "addsd %%xmm2, (%%r10,%%rax,8)\n\t"
+        "incq %%rax\n\t"
+        "jmp 5b\n"
+        "6:\n\t"
+        "addq %%rdx, %%r14\n\t"
+        "incq %%rsi\n\t"
+        "jmp 2b\n"
+        "7:\n"
+        : "+r" (ri), "+r" (rj), "+r" (rn8), "+r" (pRow),
+          "+x" (acc), "+x" (tval), "+x" (aval)
+        : "r" (rn), "r" (rm), "r" (pA), "r" (pX), "r" (pY), "r" (pT)
+        : "cc", "memory");
+  }
+```
+
+Check label usage: jge 1f at label 0 — 1 defined next, ok. jge 7f inside loop 2 — 7 defined at end; but between, labels 3,4,5,6 defined — 7f means next label 7 — unambiguous? "jge 7f" jumps forward to nearest label numbered 7; only one "7:". Good. "jge 6f" — nearest 6 forward is at "6:" after loop 5. Good. "jge 4f" → "4:". "jge 1f" good.
+
+Wait: local numeric labels f/b reference requires label defined with just digits — yes.
+
+But careful: numeric local label references like "jge 1f" in GAS with digits >0 fine.
+
+One more: `cmpq %%rbx, %%rax` then jge: t = rax - rbx; jge if t>=0 i.e. rax >= rbx → exit when j >= n. Good. `cmpq %%rdi, %%rsi; jge 7f`: exit when i >= m. Good.
+
+movsd load from memory to xmm: "movsd (mem), %%xmm2" — valid.
+
+Also potential GAS warning: movsd operand direction confusion... movsd xmm2, mem store vs load: used both forms.
+
+Alternative: DATA_TYPE could be float? atax default double. Yes.
+
+Also tmp store: `(%%r11,%%rsi,8)` with rsi=i. Good.
+
+Return only replacement code — the declarations plus asm block. Note unused i, j ints may produce warning but compiles.
+
+One concern: "register const double *pA" — GCC may complain "register specified for 'pA' isn't suitable for data type" if pointer with const? No, fine.
+
+Also GCC version nuance: specifying global register variables vs local—local require GCC>=3.1. Fine.
+
+Also possible issue: register variables bound to xmm as operands with "+x": allowed.
+
+Another subtle: "+r"for rdx initialized 0 and we compute n*8 inside — good.
+
+Also, would GCC complain about conflicting clobber "memory"? no.
+
+I think done. Should we worry about strict-aliasing with double stores? already same types.
+
+Return code only, no fences.

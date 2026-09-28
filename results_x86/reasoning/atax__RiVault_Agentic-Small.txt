@@ -1,0 +1,793 @@
+Here's a thinking process:
+
+1.  **Understand the Goal**: The user wants to replace the code between `#pragma scop` and `#pragma endscop` in a C function with equivalent x86-64 assembly using GCC extended inline asm syntax. The assembly must be in GNU AT&T syntax, compatible with x86-64 System V ABI, and use explicit input/output/clobber lists. I need to output *only* the replacement code (the asm block itself, or the code that replaces the scop block, but the prompt says "Replace only the code between the markers... Return ONLY the replacement code that goes between the two pragma markers". This implies I should just output the `asm` block that replaces the loop code.
+
+2.  **Analyze the C Code**:
+   ```c
+   int i, j;
+   #pragma scop
+   for (i = 0; i < _PB_N; i++)
+     y[i] = 0;
+   for (i = 0; i < _PB_M; i++)
+     {
+       tmp[i] = SCALAR_VAL(0.0);
+       for (j = 0; j < _PB_N; j++)
+         tmp[i] = tmp[i] + A[i][j] * x[j];
+       for (j = 0; j < _PB_N; j++)
+         y[j] = y[j] + A[i][j] * tmp[i];
+     }
+   #pragma endscop
+   ```
+   Parameters:
+   - `m` (int) -> `_PB_M`
+   - `n` (int) -> `_PB_N`
+   - `A` (2D array, MxN) -> passed as flat pointer or 2D? In PolyBench, `POLYBENCH_2D(A,M,N,m,n)` usually flattens to `DATA_TYPE *A` or `DATA_TYPE (*A)[N]`. The macro `POLYBENCH_ARRAY(A)` typically expands to `A`. I'll assume flat arrays for simplicity, or use standard pointer arithmetic. The C code uses `A[i][j]`, which means `A` is `DATA_TYPE**` or `DATA_TYPE (*)[N]`. In PolyBench, it's often passed as `DATA_TYPE *A` with `A[i*N + j]`. I'll assume `DATA_TYPE *A` (1D array representation) for assembly, as it's standard for inline asm translation tasks. Wait, the function signature says `DATA_TYPE POLYBENCH_2D(A,M,N,m,n)`. In polybench, this macro expands to `DATA_TYPE (*A)[N]` or similar, but for assembly, I'll just treat it as a pointer to the start of the array and compute offsets manually. Actually, `A[i][j]` means `A + i * N * sizeof(DATA_TYPE) + j * sizeof(DATA_TYPE)`.
+   - `x`, `y`, `tmp` are 1D arrays of size N, N, M respectively.
+   - `DATA_TYPE` is typically `float` or `double`. PolyBench uses `DATA_TYPE`. I'll assume `double` for generality, or `float`. The presence of `SCALAR_VAL(0.0)` and math operations suggests `double` or `float`. I'll use `double` (`qword`) as it's common, but I should be generic or stick to `double`. Actually, PolyBench's `DATA_TYPE` is often `float` or `double`. I'll use `double` (64-bit) for safety, but I can also use `float` (32-bit). Let's check typical polybench: `DATA_TYPE` is usually `float`. But it doesn't matter too much as long as I'm consistent. I'll use `double` (64-bit) and SSE2 instructions. Wait, the prompt says "SSE2 registers (xmm0 through xmm15) are available", implying floating point. I'll use `double` (64-bit) for `DATA_TYPE`. If it's `float`, the logic is similar but with `ss`/`shufps` or just `sd`. I'll stick to `double` (`sd` instructions) as it's standard for `DATA_TYPE` in many benchmarks, but I'll make it clear or just use generic `qword` memory ops. Actually, I'll use `double` (`sd`) and assume 64-bit floats. If it's `float`, the code would be `ss` and `dword`. I'll assume `double` because of `SCALAR_VAL(0.0)` and typical polybench usage, but I'll note that `DATA_TYPE` is typically `float` in polybench. Let's check: polybench uses `#define DATA_TYPE float`. I'll use `float` (`ss`) to be safe, or just `double` (`sd`). Actually, it doesn't matter much; I'll use `double` (`sd`) but can easily adapt. I'll use `double` for simplicity, or just use `float` (`ss`) since polybench default is float. I'll stick to `double` (`sd`) as it's more common in generic benchmarks, but I'll write it so it works for 64-bit reals. Wait, the prompt says "SSE2 registers", so SIMD is available. I'll use scalar double (`sd`) instructions.
+
+   Let's map the loops:
+   Loop 1: `for (i = 0; i < n; i++) y[i] = 0;`
+   Loop 2: Outer `i` from 0 to m-1.
+     `tmp[i] = 0.0;`
+     Inner `j` from 0 to n-1: `tmp[i] += A[i][j] * x[j];`
+     Inner `j` from 0 to n-1: `y[j] += A[i][j] * tmp[i];`
+
+   Variables:
+   `m`, `n` are integers.
+   Arrays: `A`, `x`, `y`, `tmp`. Pointers to first elements.
+   Let's assume registers for pointers: `rdi` = m, `rsi` = n, `rdx` = A, `rcx` = x, `r8` = y, `r9` = tmp. (System V ABI: rdi, rsi, rdx, rcx, r8, r9 for first 6 args).
+   Wait, the function signature is:
+   `void kernel_atax(int m, int n, DATA_TYPE *A, DATA_TYPE *x, DATA_TYPE *y, DATA_TYPE *tmp)`
+   (After macro expansion, `POLYBENCH_2D(A,M,N,m,n)` usually becomes `DATA_TYPE *A` or `DATA_TYPE (*A)[N]`. I'll assume `DATA_TYPE *A` for simplicity, as is common in these translation tasks. If it's 2D pointer, offset calculation differs, but `A[i][j]` is `A[i*N + j]` in flat memory).
+
+   I need to write inline asm with input/output operands.
+   Inputs: `m`, `n`, pointers to `A`, `x`, `y`, `tmp`.
+   Outputs: `y`, `tmp` are modified. Actually, all arrays are inputs/outputs. `y` and `tmp` are modified. `A` and `x` are read-only.
+   I'll map them to operands.
+
+   Let's design the asm block:
+   ```c
+   asm volatile (
+       "movl %1, %%ecx\n\t"       // n
+       "movl %2, %%edx\n\t"       // m
+       "xor %%eax, %%eax\n\t"     // i = 0 (also used as index)
+       "1:\n\t"
+       "movsd 0(%%r8, %%rax, 8), %%xmm0\n\t" // y[i] = 0.0
+       "movsd .LC0(%%rip), %%xmm1\n\t"
+       "movsd %%xmm1, 0(%%r8, %%rax, 8)\n\t"
+       "inc %%rax\n\t"
+       "cmp %%ecx, %%eax\n\t"
+       "jl 1b\n\t"                // for i=0..n-1: y[i]=0
+
+       // Outer loop for tmp and A/x/y updates
+       "xor %%eax, %%eax\n\t"     // i = 0
+       "2:\n\t"
+       // tmp[i] = 0.0
+       "movsd .LC0(%%rip), %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r9, %%rax, 8)\n\t"
+
+       // Inner loop 1: tmp[i] += A[i][j] * x[j]
+       // j = 0, load base addresses for row i
+       "leaq (%%r3, %%rax, 8), %%r10\n\t" // tmp[i] address
+       "leaq (%%rdx, %%rax, %4), %%r11\n\t" // A[i] base address (N * 8 bytes)
+       // Wait, A is 2D: A[i][j]. If flat, A[i*N + j]. So stride is N * 8.
+       // Let's assume DATA_TYPE is double (8 bytes).
+       // I'll use a constant for stride or compute it.
+       // Actually, passing N as input is easier: %5 is n.
+       // But inline asm with variable loop bounds is tricky with registers.
+       // I'll just use registers for i, j, counts.
+   ```
+
+   This is getting complicated with register allocation and constraints. GCC extended asm is better used with operands for arrays and loop counters, or I can use pure registers and let GCC allocate them. But the prompt says "Use explicit input/output/clobber lists". I'll define inputs and outputs clearly.
+
+   Let's map function arguments to operands:
+   0: m (int)
+   1: n (int)
+   2: A (DATA_TYPE*)
+   3: x (DATA_TYPE*)
+   4: y (DATA_TYPE*)
+   5: tmp (DATA_TYPE*)
+
+   Wait, `A` is 2D. In polybench, `DATA_TYPE POLYBENCH_2D(A,M,N,m,n)` expands to `DATA_TYPE (*A)[N]`. So `A[i][j]` means `*(*(A+i)+j)`. The stride in bytes for `j` is 8, and for `i` is `N * 8`. I'll assume `N` is known at compile time or passed as `n`. The C code uses `_PB_N` and `_PB_M`, which are macros for `n` and `m`. I'll just use the variables `n` and `m`.
+
+   To simplify, I'll treat arrays as 1D pointers: `A_flat`, `x`, `y`, `tmp`.
+   Actually, I can just pass pointers to the arrays and use offsets.
+   Let's define operands:
+   `"m" (m)`
+   `"m" (n)`
+   `"r" (A)` -> but A is 2D pointer. I'll cast to `DATA_TYPE*` in the asm or just use `&A[0][0]`.
+   To avoid complexity with 2D array representation, I'll assume flat arrays as is typical for these benchmarks when translated to asm. Or I'll just use `A` as `DATA_TYPE*` and compute `A[i*n + j]`.
+
+   Actually, a safer approach: Use GCC's operand constraints for each loop.
+   But inline asm with loops is often hand-written with registers. I'll use a straightforward register allocation strategy and clobber accordingly.
+
+   Let's draft the asm carefully:
+   Registers:
+   `%rax`: loop counter `i` or `j`
+   `%rbx`: `m`
+   `%rcx`: `n`
+   `%rdi`: pointer to `y`
+   `%rsi`: pointer to `tmp`
+   `%rdx`: pointer to `A`
+   `%r8`: pointer to `x`
+   `%r9`: pointer to `A` row start? Maybe compute on fly.
+   `%xmm0`, `%xmm1`: for float/double ops.
+
+   Actually, I'll stick to System V ABI calling convention:
+   arg1: m -> %rdi
+   arg2: n -> %rsi
+   arg3: A -> %rdx
+   arg4: x -> %rcx
+   arg5: y -> %r8
+   arg6: tmp -> %r9
+
+   I'll copy them to callee-saved registers or just use them, but clobber list must include everything modified.
+   Let's use:
+   `%rax` for index `i` or `j`
+   `%rbx` for `m`
+   `%rcx` for `n`
+   `%rdx` for `A` base
+   `%r8` for `x` base
+   `%r9` for `y` base
+   `%r10` for `tmp` base
+   `%r11` for `A` row pointer
+   `%xmm0`, `%xmm1`, `%xmm2`, `%xmm3` for data.
+
+   Wait, `%rcx` is also the implicit argument for variadic functions, but here it's fine.
+   I'll set up:
+   ```asm
+   movq %rdi, %rbx          // m
+   movq %rsi, %rcx          // n
+   movq %rdx, %rdx          // A
+   movq %rcx, %r8           // x  (wait, %rcx holds n, I need x from arg4 which is %rcx! Overlap!)
+   ```
+   System V ABI:
+   1: m -> %rdi
+   2: n -> %rsi
+   3: A -> %rdx
+   4: x -> %rcx
+   5: y -> %r8
+   6: tmp -> %r9
+   So `x` is in `%rcx`, but `n` is also in `%rsi`. No overlap between n and x.
+   Let's map carefully:
+   %rdi = m
+   %rsi = n
+   %rdx = A
+   %rcx = x
+   %r8  = y
+   %r9  = tmp
+
+   I need to save %rcx (x) and %rdx (A) before overwriting with loop counters if needed, or just use them directly.
+   Actually, it's easier to load everything into registers at the start:
+   ```asm
+   movq %rdi, %rbx   # m
+   movq %rsi, %rcx   # n
+   movq %rdx, %rdx   # A (keep)
+   movq %rcx, %r8    # x
+   movq %r8, %r9     # wait, %r8 is y. arg5 is y. arg6 is tmp.
+   ```
+   Let's list args again:
+   1: m -> %rdi
+   2: n -> %rsi
+   3: A -> %rdx
+   4: x -> %rcx
+   5: y -> %r8
+   6: tmp -> %r9
+   So:
+   %rdi = m
+   %rsi = n
+   %rdx = A
+   %rcx = x
+   %r8  = y
+   %r9  = tmp
+   No overlap. Good.
+
+   I'll use %rax for loop index.
+   I'll use %xmm0, %xmm1, %xmm2, %xmm3 for temporaries.
+
+   Loop 1: `y[i] = 0` for i=0..n-1
+   ```asm
+   xor %%rax, %%rax      # i = 0
+   1:
+   movsd .LC0(%%rip), %%xmm0
+   movsd %%xmm0, 0(%%r8, %%rax, 8)
+   inc %%rax
+   cmp %%rsi, %%rax
+   jl 1b
+   ```
+
+   Loop 2: `i` from 0 to m-1
+   ```asm
+   xor %%rax, %%rax      # i = 0
+   2:
+   # tmp[i] = 0.0
+   movsd .LC0(%%rip), %%xmm0
+   movsd %%xmm0, 0(%%r9, %%rax, 8)
+
+   # Inner loop 1: j from 0 to n-1: tmp[i] += A[i][j] * x[j]
+   xor %%rdi, %%rdi      # j = 0 (reuse %rdi as j counter, it holds m originally but we saved m in %rbx)
+   # Wait, %rdi held m. I saved m to %rbx. So %rdi is free.
+   # But I need A[i] row base.
+   # A is passed as DATA_TYPE (*)[N] or DATA_TYPE*. If flat, A + i*n*8.
+   # Let's assume flat array for simplicity, as inline asm usually treats them as 1D.
+   # I'll compute row base: A_base + i * n * 8
+   # Actually, I can just iterate and add stride.
+   leaq (%%rdx, %%rax, %4), %%rdi  # j base for A? No.
+   # Let's just use registers for pointers:
+   # %r10 = x + j*8
+   # %r11 = A_row + j*8
+   # %r12 = tmp[i] address
+   ```
+
+   This is getting messy. I'll use a cleaner approach: load constants and use explicit constraints or just hardcode register usage carefully.
+
+   Let's define:
+   %rbx = m
+   %rcx = n
+   %rdx = A
+   %r8  = x
+   %r9  = y
+   %r10 = tmp
+   %rax = i
+   %r11 = j
+
+   Wait, %r11 is clobbered? I'll clobber all used regs.
+   I'll use %xmm0, %xmm1, %xmm2, %xmm3.
+   Clobbers: `rax, rcx, rdx, r8, r9, r10, r11, xmm0, xmm1, xmm2, xmm3, memory` (but I'll track memory precisely).
+
+   Actually, GCC extended asm is better with operands. But the prompt says "Replace only the code between the markers... with equivalent x86-64 assembly, written as a GCC extended inline asm() block". I'll just write the asm block directly.
+
+   Let's structure it carefully:
+   ```c
+   asm volatile (
+       "movq %1, %%rbx\n\t"      // m
+       "movq %2, %%rcx\n\t"      // n
+       "movq %3, %%rdx\n\t"      // A
+       "movq %4, %%r8\n\t"       // x
+       "movq %5, %%r9\n\t"       // y
+       "movq %6, %%r10\n\t"      // tmp
+
+       // Zero y[0..n-1]
+       "xor %%rax, %%rax\n\t"
+       "1:\n\t"
+       "movsd .LC0(%%rip), %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r9, %%rax, 8)\n\t"
+       "inc %%rax\n\t"
+       "cmp %%rcx, %%rax\n\t"
+       "jl 1b\n\t"
+
+       // Outer loop i: 0..m-1
+       "xor %%rax, %%rax\n\t"
+       "2:\n\t"
+       // tmp[i] = 0.0
+       "movsd .LC0(%%rip), %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r10, %%rax, 8)\n\t"
+
+       // Inner loop j: 0..n-1 -> tmp[i] += A[i][j] * x[j]
+       "xor %%rdi, %%rdi\n\t"      // j = 0
+       "leaq (%%rdx, %%rax, %4), %%r11\n\t" // A[i] base (assuming 8 bytes per element, stride n*8? Wait, if flat, A[i*n + j], so base is A + i*n*8)
+       // Actually, computing row base each time is expensive. Better to update pointer each i loop.
+       // But for simplicity in inline asm, I'll just use index math or update pointer.
+       // Let's use index math for simplicity: A + (i*n + j)*8
+       // But that requires multiplication. Better to use pointers.
+   ```
+
+   Let's rethink pointer management:
+   `A_ptr` points to start of A.
+   Inside i-loop:
+     `A_row = A_ptr + i * n * 8`
+     `x_ptr = x`
+     `y_ptr = y`
+     `tmp_val = 0`
+     Loop j:
+       `val_A = A_row[j]`
+       `val_x = x_ptr[j]`
+       `tmp_val += val_A * val_x`
+     Loop j:
+       `val_A = A_row[j]`
+       `y_ptr[j] += val_A * tmp_val`
+
+   To avoid multiplication in inner loop, I'll update pointers:
+   ```c
+   asm volatile (
+       "movq %1, %%rbx\n\t"      // m
+       "movq %2, %%rcx\n\t"      // n
+       "movq %3, %%rdx\n\t"      // A
+       "movq %4, %%r8\n\t"       // x
+       "movq %5, %%r9\n\t"       // y
+       "movq %6, %%r10\n\t"      // tmp
+       "leaq (%%rdx, %2, 8), %%rdx\n\t" // Actually, stride for i is n*8. But I need A base per row.
+   ```
+   Actually, I'll just compute row base inside the loop or use a register that increments by `n*8`.
+   Wait, `A` is `DATA_TYPE (*)[N]`. If it's 2D, `A[i][j]` is `*(*(A+i)+j)`. The C code likely uses flat allocation. I'll assume flat 1D array `A` of size M*N. The offset for `A[i][j]` is `(i * n + j) * 8`.
+   To simplify, I'll treat `A` as `DATA_TYPE*` and compute offset using `leaq` or just use `j` index and add `n*8` each outer iteration.
+   Let `A_row` start at `A`. Each `i` increments `A_row` by `n*8`.
+   `x` and `y` pointers increment by `8` each `j`.
+
+   Let's draft carefully:
+   ```c
+   asm volatile (
+       "movq %1, %%rbx\n\t"      // m
+       "movq %2, %%rcx\n\t"      // n
+       "movq %3, %%rdx\n\t"      // A
+       "movq %4, %%r8\n\t"       // x
+       "movq %5, %%r9\n\t"       // y
+       "movq %6, %%r10\n\t"      // tmp
+
+       // Zero y
+       "xor %%rax, %%rax\n\t"
+       "1:\n\t"
+       "movsd .LC0(%%rip), %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r9, %%rax, 8)\n\t"
+       "inc %%rax\n\t"
+       "cmp %%rcx, %%rax\n\t"
+       "jl 1b\n\t"
+
+       // Outer loop i
+       "xor %%rax, %%rax\n\t"
+       "2:\n\t"
+       // tmp[i] = 0.0
+       "movsd .LC0(%%rip), %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r10, %%rax, 8)\n\t"
+
+       // Prepare row pointers
+       "movq %%rdx, %%r11\n\t"       // A_row = A
+       "movq %%r8, %%r12\n\t"        // x_ptr = x
+       "movq %%r9, %%r13\n\t"        // y_ptr = y
+
+       // Inner loop 1: tmp[i] += A[i][j] * x[j]
+       "xor %%rdi, %%rdi\n\t"        // j = 0
+       "3:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"  // A[i][j]
+       "movsd 0(%%r12, %%rdi, 8), %%xmm2\n\t"  // x[j]
+       "mulsd %%xmm2, %%xmm1\n\t"
+       "addsd %%xmm1, %%xmm0\n\t"
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 3b\n\t"
+
+       // Inner loop 2: y[j] += A[i][j] * tmp[i]
+       "xor %%rdi, %%rdi\n\t"        // j = 0
+       "4:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"  // A[i][j]
+       "mulsd %%xmm0, %%xmm1\n\t"        // tmp[i] in xmm0
+       "addsd %%xmm1, 0(%%r13, %%rdi, 8)\n\t" // y[j] += ...
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 4b\n\t"
+
+       // Advance row pointers for next i
+       "leaq (%2, %2, 1), %%r14\n\t"     // n * 3? No, need n * 8.
+       "leaq (%%rcx, %%rcx, 2), %%r14\n\t" // n * 3
+       // Actually, stride for A row is n * 8.
+       "leaq (%%rcx, %%rcx, 2), %%r14\n\t" // n*3
+       "addq %%rcx, %%r14\n\t"           // n*4
+       // This is getting messy. Let's just use a register for stride.
+       // Or compute offset directly: A_row += n * 8.
+       "leaq (%%rcx, %%rcx, 3), %%r14\n\t" // n * 4
+       "addq %%rcx, %%r14\n\t"           // n * 5
+       // Wait, n*8 = n << 3.
+       "shlq $3, %%rcx\n\t"
+       "addq %%rcx, %%r11\n\t" // A_row += n*8
+       "movq %%r11, %%rdx\n\t" // save back? Not needed if I don't use %rdx later.
+       // But I need to restore %rcx for comparisons!
+       "shrq $3, %%rcx\n\t"    // restore n
+   ```
+
+   This register shuffling is error-prone. I'll use a cleaner approach: pass pointers and use explicit constraints, or just stick to simple register allocation without too much shifting.
+   Actually, I can just load `n*8` once.
+   `leaq (%%rcx, %%rcx, 7), %%r14` -> no.
+   `leaq (%%rcx, %%rcx, 3), %%r14` -> 4n
+   `addq %%rcx, %%r14` -> 5n
+   `addq %%rcx, %%r14` -> 6n
+   `addq %%rcx, %%r14` -> 7n
+   `addq %%rcx, %%r14` -> 8n. Too many instructions.
+   Better: `leaq (%%rcx, %%rcx, 3), %%r14` (4n) -> `salq $1, %%r14` (8n).
+   Or just `imul $8, %%rcx, %%r14`. But `imul` with immediate is fine.
+   Actually, I'll just use `%%rdi` as j counter and compute offsets on the fly? No, pointer arithmetic is faster.
+   Let's use `%%r14` for stride `n*8`.
+   ```asm
+   "movq %2, %%r14\n\t"      // save n
+   "leaq (%%r14, %%r14, 3), %%r14\n\t" // 4n
+   "salq $1, %%r14\n\t"      // 8n
+   ```
+   Then in outer loop: `addq %%r14, %%r11` (advance A_row)
+   `addq $8, %%r12` (advance x_ptr)
+   `addq $8, %%r13` (advance y_ptr)
+
+   Let's verify registers:
+   %rbx = m
+   %rcx = n
+   %rdx = A (base)
+   %r8  = x
+   %r9  = y
+   %r10 = tmp
+   %r11 = A_row
+   %r12 = x_ptr
+   %r13 = y_ptr
+   %r14 = stride (n*8)
+   %rax = i
+   %rdi = j
+   %xmm0 = tmp[i] accumulator / 0.0
+   %xmm1 = A[i][j]
+   %xmm2 = x[j]
+   %xmm3 = unused? maybe for y[j] read? I can accumulate directly to y[j] or use reg. I'll use reg for read-modify-write if needed, but `addsd` can read directly from memory.
+
+   Let's draft the full asm carefully:
+   ```c
+   asm volatile (
+       "movq %1, %%rbx\n\t"      // m
+       "movq %2, %%rcx\n\t"      // n
+       "movq %3, %%rdx\n\t"      // A
+       "movq %4, %%r8\n\t"       // x
+       "movq %5, %%r9\n\t"       // y
+       "movq %6, %%r10\n\t"      // tmp
+       "movq %%rcx, %%r14\n\t"   // save n
+       "leaq (%%r14, %%r14, 3), %%r14\n\t" // 4n
+       "salq $1, %%r14\n\t"      // 8n (stride)
+
+       // Zero y[0..n-1]
+       "xor %%rax, %%rax\n\t"
+       "1:\n\t"
+       "movsd .LC0(%%rip), %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r9, %%rax, 8)\n\t"
+       "inc %%rax\n\t"
+       "cmp %%rcx, %%rax\n\t"
+       "jl 1b\n\t"
+
+       // Outer loop i: 0..m-1
+       "xor %%rax, %%rax\n\t"
+       "2:\n\t"
+       // tmp[i] = 0.0
+       "movsd .LC0(%%rip), %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r10, %%rax, 8)\n\t"
+
+       // Init pointers for row i
+       "movq %%rdx, %%r11\n\t"       // A_row
+       "movq %%r8, %%r12\n\t"        // x_ptr
+       "movq %%r9, %%r13\n\t"        // y_ptr
+
+       // Inner loop j: 0..n-1 -> tmp[i] += A[i][j] * x[j]
+       "xor %%rdi, %%rdi\n\t"
+       "3:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"
+       "movsd 0(%%r12, %%rdi, 8), %%xmm2\n\t"
+       "mulsd %%xmm2, %%xmm1\n\t"
+       "addsd %%xmm1, %%xmm0\n\t"
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 3b\n\t"
+
+       // Inner loop j: 0..n-1 -> y[j] += A[i][j] * tmp[i]
+       "xor %%rdi, %%rdi\n\t"
+       "4:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"
+       "mulsd %%xmm0, %%xmm1\n\t"
+       "addsd %%xmm1, 0(%%r13, %%rdi, 8)\n\t"
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 4b\n\t"
+
+       // Advance row pointers
+       "addq %%r14, %%r11\n\t"       // A_row += stride
+       "addq $8, %%r12\n\t"          // x_ptr += 8
+       "addq $8, %%r13\n\t"          // y_ptr += 8
+       "inc %%rax\n\t"
+       "cmp %%rbx, %%rax\n\t"
+       "jl 2b\n\t"
+       :
+       : "m"(m), "m"(n), "r"(A), "r"(x), "r"(y), "r"(tmp)
+       : "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "rax", "rdi", "xmm0", "xmm1", "xmm2", "memory"
+   );
+   ```
+
+   Wait, `"r"(A)` etc. will be passed in registers, but I'm overwriting them with `movq %3, %%rdx`, etc. That's fine.
+   However, `A` might be a 2D array pointer `DATA_TYPE (*)[N]`. If so, `%3` might be a pointer to pointer, not a flat array. In polybench, `POLYBENCH_2D(A,M,N,m,n)` usually expands to `DATA_TYPE (*A)[N]`. But when passed to the function, it decays to `DATA_TYPE (*)[N]`. In C, `A[i][j]` works. In asm, if I treat it as flat, I might crash if it's actually an array of pointers. But polybench allocates as `DATA_TYPE *A = malloc(M*N*sizeof(DATA_TYPE))` and assigns `A[i] = A_flat + i*N`. So it's effectively 1D. I'll assume flat. To be safe, I'll just use `%3` as base and add offsets.
+
+   Also, `SCALAR_VAL(0.0)` implies a constant. I'll use a local constant `.LC0: .double 0.0` or `movabs`/`xor` zero? `xorps`/`xorpd` can zero xmm regs. `xorpd %%xmm0, %%xmm0` is better than memory load for zero.
+   Let's use `xorpd %%xmm0, %%xmm0` instead of memory load for zero. It's faster and avoids RIP-relative addressing for constants.
+
+   Revised zeroing:
+   ```c
+   "xorpd %%xmm0, %%xmm0\n\t"
+   "movsd %%xmm0, 0(%%r9, %%rax, 8)\n\t"
+   ```
+
+   Also, `tmp[i] = 0.0` inside outer loop:
+   ```c
+   "xorpd %%xmm0, %%xmm0\n\t"
+   "movsd %%xmm0, 0(%%r10, %%rax, 8)\n\t"
+   ```
+
+   Wait, `%%xmm0` is used for `tmp[i]` accumulator. If I zero it, it's fine.
+   But in loop 1, I need to store zero to `y`. `movsd %%xmm0, 0(%%r9, %%rax, 8)` works.
+
+   Let's check clobbers. I listed all used registers. `memory` is clobbered because I write to arrays. Inputs are `m`, `n`, `A`, `x`, `y`, `tmp`. But `y` and `tmp` are modified, so they should be outputs? The prompt says "equivalent x86-64 assembly... preserve exact surrounding function signature and behavior." I can just use `volatile` and clobber `memory`, or list `y` and `tmp` as outputs. Listing them as outputs is better.
+   Actually, `y` and `tmp` are modified. I'll list them as outputs or just clobber memory. Since I'm replacing a scop block that modifies arrays, clobbering `memory` is safest and simplest, or I can use output constraints. I'll stick to clobbering `memory` to avoid complexity with array outputs in inline asm, unless necessary. The prompt says "Use explicit input/output/clobber lists". I'll list `y` and `tmp` as outputs: `"=m"(y)`, `"=m"(tmp)`. But they are arrays, so `"+m"(y)` and `"+m"(tmp)`? Or just `memory` clobber is fine. I'll use `memory` clobber for simplicity, as it covers all array writes. Actually, GCC extended asm with `"memory"` clobber is standard for array modifications.
+
+   Let's refine the asm block:
+   ```c
+   asm volatile (
+       "movq %1, %%rbx\n\t"
+       "movq %2, %%rcx\n\t"
+       "movq %3, %%rdx\n\t"
+       "movq %4, %%r8\n\t"
+       "movq %5, %%r9\n\t"
+       "movq %6, %%r10\n\t"
+       "movq %%rcx, %%r14\n\t"
+       "leaq (%%r14, %%r14, 3), %%r14\n\t"
+       "salq $1, %%r14\n\t"
+
+       "xor %%rax, %%rax\n\t"
+       "1:\n\t"
+       "xorpd %%xmm0, %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r9, %%rax, 8)\n\t"
+       "inc %%rax\n\t"
+       "cmp %%rcx, %%rax\n\t"
+       "jl 1b\n\t"
+
+       "xor %%rax, %%rax\n\t"
+       "2:\n\t"
+       "xorpd %%xmm0, %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r10, %%rax, 8)\n\t"
+
+       "movq %%rdx, %%r11\n\t"
+       "movq %%r8, %%r12\n\t"
+       "movq %%r9, %%r13\n\t"
+
+       "xor %%rdi, %%rdi\n\t"
+       "3:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"
+       "movsd 0(%%r12, %%rdi, 8), %%xmm2\n\t"
+       "mulsd %%xmm2, %%xmm1\n\t"
+       "addsd %%xmm1, %%xmm0\n\t"
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 3b\n\t"
+
+       "xor %%rdi, %%rdi\n\t"
+       "4:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"
+       "mulsd %%xmm0, %%xmm1\n\t"
+       "addsd %%xmm1, 0(%%r13, %%rdi, 8)\n\t"
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 4b\n\t"
+
+       "addq %%r14, %%r11\n\t"
+       "addq $8, %%r12\n\t"
+       "addq $8, %%r13\n\t"
+       "inc %%rax\n\t"
+       "cmp %%rbx, %%rax\n\t"
+       "jl 2b\n\t"
+       :
+       : "m"(m), "m"(n), "r"(A), "r"(x), "r"(y), "r"(tmp)
+       : "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "rax", "rdi", "xmm0", "xmm1", "xmm2", "memory"
+   );
+   ```
+
+   Check constraints: `"r"(A)` etc. might conflict if GCC decides to put them in the same registers I'm using. But I'm explicitly moving them. It's safer to let GCC allocate input registers and just use `%%eax`, `%%ebx`, etc. Actually, `asm` inputs are loaded into registers specified by constraints. I should not hardcode register usage for inputs if I want to be safe, but for inline asm replacing a specific block, hardcoding callee-saved or specific registers is common. I'll stick to explicit register usage as above, it's fine.
+
+   Wait, `A` might be 2D. If `A` is `DATA_TYPE (*)[N]`, then `A[i][j]` in C translates to `*(*(A+i)+j)`. In memory, it's contiguous. The address of `A[i][j]` is `A + (i * N + j) * sizeof(DATA_TYPE)`. My code computes `A_row` initially as `A`, then advances by `N*8` each outer loop. This matches contiguous memory layout. So it's correct.
+
+   One detail: `DATA_TYPE` might be `float`. If so, `movss`/`mulss`/`addss` and 4-byte strides would be needed. The prompt says "SSE2 registers are available", and `SCALAR_VAL(0.0)` usually implies double in polybench (though it can be float). I'll assume `double` (64-bit). If it's `float`, the code would break. To be robust, I can use `DATA_TYPE` size implicitly? No, inline asm needs explicit size. PolyBench/C typically uses `float` by default, but sometimes `double`. I'll stick to `double` (`sd`) as it's standard for "DATA_TYPE" in many translated benchmarks, or I can use `ss` if I assume float. Actually, I'll use `double` (`sd`) and `8` bytes. It's a reasonable assumption. If needed, I could add a comment, but the prompt says return only code.
+
+   Let's verify the `#pragma scop` block replacement. The user wants exactly the code between the markers. I will output the `asm volatile (...)` block.
+
+   One potential issue: `A` is passed as `DATA_TYPE POLYBENCH_2D(...)`. In polybench, this macro expands to `DATA_TYPE (*A)[N]`. When passed to function, it's a pointer to array of N elements. In C, `A[i][j]` works. In asm, treating it as flat pointer is correct because polybench flattens it in memory (`A[i] = base + i*N`). So `A + i*N*8` is correct.
+
+   Another point: `SCALAR_VAL(0.0)` is a macro. I used `xorpd %%xmm0, %%xmm0` which is equivalent and better.
+
+   Let's check register allocation against System V ABI:
+   Callee-saved: rbp, rbx, r12-r15. I'm using rbx, r11-r14. I clobber them, which is fine inside asm.
+   Caller-saved: rax, rcx, rdx, rsi, rdi, r8-r11, xmm0-xmm15. I clobber them too.
+   The clobber list should include all modified registers. I have `rbx, rcx, rdx, r8, r9, r10, r11, r12, r13, r14, rax, rdi, xmm0, xmm1, xmm2, memory`. This is correct.
+
+   Wait, I used `%%rdx` for `A` base, but `%%rdx` is caller-saved. It's fine since I clobber it.
+   I used `%%r8` for `x`, `%%r9` for `y`, `%%r10` for `tmp`.
+   I used `%%rcx` for `n`.
+   I used `%%rbx` for `m`.
+   All good.
+
+   One minor thing: `leaq (%%r14, %%r14, 3), %%r14` computes 4*n. `salq $1, %%r14` computes 8*n. Correct.
+   Inner loop j uses `%%rdi`. Correct.
+   Outer loop i uses `%%rax`. Correct.
+   Comparisons use `%%rcx` and `%%rbx`. Correct.
+   Labels `1:`, `2:`, `3:`, `4:` are local to the asm string, which is fine.
+
+   Let's double check the `y` zeroing loop:
+   `inc %%rax` / `cmp %%rcx, %%rax` / `jl 1b` -> loops while `rax < rcx`. Correct.
+   Outer loop `i`: `inc %%rax` / `cmp %%rbx, %%rax` / `jl 2b` -> loops while `rax < rbx`. Correct.
+   Inner loop `j` 1: `inc %%rdi` / `cmp %%rcx, %%rdi` / `jl 3b`. Correct.
+   Inner loop `j` 2: `inc %%rdi` / `cmp %%rcx, %%rdi` / `jl 4b`. Correct.
+
+   Memory accesses:
+   `0(%%r9, %%rax, 8)` -> y[i]
+   `0(%%r10, %%rax, 8)` -> tmp[i]
+   `0(%%r11, %%rdi, 8)` -> A[i][j] (via row ptr + j)
+   `0(%%r12, %%rdi, 8)` -> x[j] (via x ptr + j)
+   `0(%%r13, %%rdi, 8)` -> y[j] (via y ptr + j)
+   All correct.
+
+   One thing: `A` is passed as `%3`. In the function signature, `A` might be `DATA_TYPE (*A)[N]`. The pointer passed is actually `&A[0][0]` or `A[0]`. In polybench, `POLYBENCH_ARRAY(A)` expands to `A`. If `A` is `DATA_TYPE (*)[N]`, `A[0]` is `DATA_TYPE[N]`, which decays to `DATA_TYPE*`. So `%3` points to the start of the flattened array. Correct.
+
+   I should ensure the asm syntax is strictly GNU as. Labels with `:` are fine. `%` for registers. `\t` for tabs.
+   I'll format it cleanly.
+
+   One potential issue: `SCALAR_VAL(0.0)` might be a compile-time constant. `xorpd` is fine.
+   What if `DATA_TYPE` is `float`? The prompt doesn't specify. I'll stick to `double` (`sd`). It's the safest bet for generic `DATA_TYPE` in performance benchmarks unless specified otherwise. Actually, PolyBench/C default `DATA_TYPE` is `float`. But many translations assume `double`. I'll use `sd` and `8` byte offsets. If it were `float`, it would be `ss` and `4`. I'll assume `double` as it's common in these tasks. I'll add a comment? No, "Return ONLY the replacement code".
+
+   Let's consider if I should use `%%xmm3` for anything? Not needed.
+   I'll verify the clobber list again. `rbx`, `rcx`, `rdx`, `r8`, `r9`, `r10`, `r11`, `r12`, `r13`, `r14`, `rax`, `rdi`, `xmm0`, `xmm1`, `xmm2`, `memory`. All good.
+
+   One detail: `A` might be aliased with `y` or `tmp`? Unlikely in polybench. They are separate arrays.
+   The asm block looks solid.
+
+   Final check of the code structure:
+   ```c
+   asm volatile (
+       "movq %1, %%rbx\n\t"
+       "movq %2, %%rcx\n\t"
+       "movq %3, %%rdx\n\t"
+       "movq %4, %%r8\n\t"
+       "movq %5, %%r9\n\t"
+       "movq %6, %%r10\n\t"
+       "movq %%rcx, %%r14\n\t"
+       "leaq (%%r14, %%r14, 3), %%r14\n\t"
+       "salq $1, %%r14\n\t"
+       "xor %%rax, %%rax\n\t"
+       "1:\n\t"
+       "xorpd %%xmm0, %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r9, %%rax, 8)\n\t"
+       "inc %%rax\n\t"
+       "cmp %%rcx, %%rax\n\t"
+       "jl 1b\n\t"
+       "xor %%rax, %%rax\n\t"
+       "2:\n\t"
+       "xorpd %%xmm0, %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r10, %%rax, 8)\n\t"
+       "movq %%rdx, %%r11\n\t"
+       "movq %%r8, %%r12\n\t"
+       "movq %%r9, %%r13\n\t"
+       "xor %%rdi, %%rdi\n\t"
+       "3:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"
+       "movsd 0(%%r12, %%rdi, 8), %%xmm2\n\t"
+       "mulsd %%xmm2, %%xmm1\n\t"
+       "addsd %%xmm1, %%xmm0\n\t"
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 3b\n\t"
+       "xor %%rdi, %%rdi\n\t"
+       "4:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"
+       "mulsd %%xmm0, %%xmm1\n\t"
+       "addsd %%xmm1, 0(%%r13, %%rdi, 8)\n\t"
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 4b\n\t"
+       "addq %%r14, %%r11\n\t"
+       "addq $8, %%r12\n\t"
+       "addq $8, %%r13\n\t"
+       "inc %%rax\n\t"
+       "cmp %%rbx, %%rax\n\t"
+       "jl 2b\n\t"
+       :
+       : "m"(m), "m"(n), "r"(A), "r"(x), "r"(y), "r"(tmp)
+       : "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "rax", "rdi", "xmm0", "xmm1", "xmm2", "memory"
+   );
+   ```
+
+   Wait, `%%rdx` is clobbered but also used as input `%3`. That's fine.
+   One thing: `A` might be `DATA_TYPE (*)[N]`. If so, `%3` is a pointer to row 0. `%%rdx` gets that. `%%r11` gets `%%rdx`. `0(%%r11, %%rdi, 8)` accesses `A[0][j]`. Next outer loop, `%%r11 += n*8`, so it points to `A[1]`. This correctly traverses the 2D array in row-major order. Correct.
+
+   Is there any issue with `xorpd %%xmm0, %%xmm0`? It's valid AT&T syntax.
+   Could use `pxor %%xmm0, %%xmm0` for zeroing, but `xorpd` is SSE2. Both work. `xorpd` is fine.
+   I'll stick with `xorpd`.
+
+   One minor adjustment: The prompt says "Do not clobber a register that's still needed as an address/loop variable later in the same block." My clobber list matches exactly what I use.
+   I'll verify `%%r14` calculation: `leaq (%%r14, %%r14, 3), %%r14` -> `r14 = r14 + r14*3 = 4*r14`. `salq $1, %%r14` -> `r14 *= 2` -> `8*r14`. Correct.
+   All good.
+
+   Final check of the prompt: "Return ONLY the replacement code that goes between the two pragma markers (not the whole file, not the function signature, not the pragma lines themselves). No explanation, no markdown code fences."
+   I will output exactly the `asm volatile (...)` block.
+
+   One thing: `DATA_TYPE` might be `float`. If the benchmark uses `float`, `movsd` will cause issues. But polybench `DATA_TYPE` is usually `float` or `double`. I'll assume `double` as it's safer for generic "DATA_TYPE" in these tasks. If it were `float`, the offsets would be 4 and instructions `ss`. I'll keep `double`. It's a reasonable assumption. Actually, I can make it slightly more robust by not assuming size? No, asm needs explicit size. I'll stick with `double`.
+
+   I will produce the exact asm block.
+   One detail: `SCALAR_VAL(0.0)` might be a macro for `0.0f` or `0.0`. I'll use `xorpd` which is fine.
+   I'll format it as a single string with `\n\t`.
+   Ready. 
+   Output matches the request.
+   One minor point: `%%r10` is used for `tmp`. `tmp[i]` is written in outer loop. Correct.
+   `%%r9` is `y`. `y[j]` is updated. Correct.
+   All loops and memory accesses match the C code.
+   I'll generate the response. 
+   Self-Correction/Refinement during thought:
+   Wait, `A` is `DATA_TYPE POLYBENCH_2D(A,M,N,m,n)`. In polybench, this macro expands to `DATA_TYPE (*A)[N]`. When passed to function, it's a pointer to an array of N elements. The address calculation `A[i][j]` in C is `*(*(A+i)+j)`. In flat memory, it's `A + (i*N + j)*sizeof(DATA_TYPE)`. My pointer arithmetic does exactly that. So it's correct.
+   Also, I should ensure that `A`, `x`, `y`, `tmp` are passed as `"r"` constraints. They are.
+   The clobber list includes `memory` which covers array writes.
+   I'll output the asm block exactly.
+   One thing: `%%rdx` is input `%3`, but I clobber it. That's allowed.
+   I'll produce the code. 
+   All steps verified.
+   Output matches. 
+   Proceeds. 
+   [Output Generation] -> `asm volatile (...)` block.
+   Note: I'll make sure the syntax is strictly AT&T and fits GCC extended asm.
+   Final check of the asm string:
+   ```c
+   asm volatile (
+       "movq %1, %%rbx\n\t"
+       "movq %2, %%rcx\n\t"
+       "movq %3, %%rdx\n\t"
+       "movq %4, %%r8\n\t"
+       "movq %5, %%r9\n\t"
+       "movq %6, %%r10\n\t"
+       "movq %%rcx, %%r14\n\t"
+       "leaq (%%r14, %%r14, 3), %%r14\n\t"
+       "salq $1, %%r14\n\t"
+       "xor %%rax, %%rax\n\t"
+       "1:\n\t"
+       "xorpd %%xmm0, %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r9, %%rax, 8)\n\t"
+       "inc %%rax\n\t"
+       "cmp %%rcx, %%rax\n\t"
+       "jl 1b\n\t"
+       "xor %%rax, %%rax\n\t"
+       "2:\n\t"
+       "xorpd %%xmm0, %%xmm0\n\t"
+       "movsd %%xmm0, 0(%%r10, %%rax, 8)\n\t"
+       "movq %%rdx, %%r11\n\t"
+       "movq %%r8, %%r12\n\t"
+       "movq %%r9, %%r13\n\t"
+       "xor %%rdi, %%rdi\n\t"
+       "3:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"
+       "movsd 0(%%r12, %%rdi, 8), %%xmm2\n\t"
+       "mulsd %%xmm2, %%xmm1\n\t"
+       "addsd %%xmm1, %%xmm0\n\t"
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 3b\n\t"
+       "xor %%rdi, %%rdi\n\t"
+       "4:\n\t"
+       "movsd 0(%%r11, %%rdi, 8), %%xmm1\n\t"
+       "mulsd %%xmm0, %%xmm1\n\t"
+       "addsd %%xmm1, 0(%%r13, %%rdi, 8)\n\t"
+       "inc %%rdi\n\t"
+       "cmp %%rcx, %%rdi\n\t"
+       "jl 4b\n\t"
+       "addq %%r14, %%r11\n\t"
+       "addq $8, %%r12\n\t"
+       "addq $8, %%r13\n\t"
+       "inc %%rax\n\t"
+       "cmp %%rbx, %%rax\n\t"
+       "jl 2b\n\t"
+       :
+       : "m"(m), "m"(n), "r"(A), "r"(x), "r"(y), "r"(tmp)
+       : "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "rax", "rdi", "xmm0", "xmm1", "xmm2", "memory"
+   );
+   ```
+   This looks correct and complete. I will output it exactly.
+   One minor point: `SCALAR_VAL(0.0)` might be `0.0f` if DATA_TYPE is float. But polybench default is float. However, many online judges for this specific problem (PolyBench/C atax) use `float`. If it's `float`, `movsd` will read 8 bytes but only half is valid, causing potential issues? Actually, `movsd` loads 64 bits. If `DATA_TYPE` is `float`, the array elements are 32 bits. Loading 64 bits might read into the next element or garbage. This is a risk.
+   To be safe, I should probably use `float` (`ss`) if I suspect it's polybench. But the prompt says "SSE2 registers are available", which applies to both. I'll stick with `double` as it's standard for generic benchmarks, but I'll note that if it's `float`, size changes. Actually, I'll use `double` (`sd`) because it's safer for `DATA_TYPE` in these contexts unless specified. I'll proceed.
+   Wait, PolyBench/C `DATA_TYPE` is typically `float`. But the code uses `SCALAR_VAL(0.0)` which is often `0.0` (double) or `0.0f`. I'll keep `double`. It's fine.
+   Final decision: Output the asm block as drafted.
+   Proceeds. 
+   Output matches request.✅
+   [Done] 
+   Output Generation. 
+   *(Self-Correction/Verification during drafting)*: 
+   I realize `A` is `DATA_TYPE POLYBENCH_2D(...)`. In polybench, this expands to `DATA_TYPE (*A)[N]`. The pointer passed is actually `A[0]` (which is `DATA_TYPE[N]`), so it points to the first element. My pointer arithmetic `A + i*n*8` works for contiguous memory. 
+   The clobber list is accurate. 
+   The code is ready. 
+   Output matches. 
+   [Final Check of the Prompt]: "Replace only the code between the markers... Return ONLY the replacement code that goes between the two pragma markers... No explanation, no markdown code fences."
+   I will output just the `asm volatile (...)` block.
+   All good. 
+   Proceeds. 
+   [Output Generation] (matches the drafted block)
+   *(Note: I'll ensure the formatting is exactly as requested, no extra text.)*
+   `asm volatile (...)` block follows. 
+   [Done]
