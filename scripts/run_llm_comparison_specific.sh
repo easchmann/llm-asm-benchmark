@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-# same as run_llm_comparison.sh but uses the more specific prompt andwrites to results_specific/ 
+# same as run_llm_comparison.sh but uses the more specific prompt andwrites to results_specific/
 # usage: ./run_llm_comparison_specific.sh atax bicg mvt
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUITE="$ROOT/kernels/polybench-c-4.2"
 UTIL="$SUITE/utilities"
-RESULTS="$ROOT/results_specific_2"
-WORK="$ROOT/.work/llm_compare_specific_2"
 FREEDOS_IMG="$ROOT/freedos/hdd.img"
 PART_OFFSET=32256
-SUMMARY="$RESULTS/comparison.csv"
 PROMPT="$ROOT/prompts/i8086_prompt_specific.txt"
+
+# each invocation gets a fresh, never-reused run directory under results/
+RESULTS_BASE="${RESULTS_BASE:-$ROOT/results}"
+BASE="llm_compare_specific"
+RUN_ID="${RUN_ID:-${BASE}_$(date +%Y%m%d_%H%M%S)}"
+n=0
+while [ -d "$RESULTS_BASE/$RUN_ID" ]; do n=$((n+1)); RUN_ID="${RUN_ID}-$n"; done
+RESULTS="$RESULTS_BASE/$RUN_ID"
+WORK="$ROOT/.work/$RUN_ID"
+CODE="$RESULTS/code"
+SUMMARY="$RESULTS/comparison.csv"
+mkdir -p "$RESULTS" "$WORK" "$CODE"
 
 # chat/instruction models only
 ALIASES=(RiVault/Reasoning-Tiny RiVault/Reasoning-Small RiVault/Reasoning-Medium RiVault/Reasoning-Large
@@ -22,9 +31,20 @@ kernels=()
 for a in "$@"; do [ "$a" = "--dry-run" ] && dry="--dry-run" || kernels+=("$a"); done
 [ ${#kernels[@]} -eq 0 ] && kernels=(atax bicg mvt)
 
-mkdir -p "$RESULTS" "$WORK"
-[ -f "$SUMMARY" ] || echo "kernel,alias,underlying_model,compiled,result" > "$SUMMARY"
+[ -f "$SUMMARY" ] || echo "kernel,alias,underlying_model,compiled,result,repairs" > "$SUMMARY"
 flags="-DMINI_DATASET -DPOLYBENCH_DUMP_ARRAYS -I $UTIL"
+
+# describe this run inside its own directory
+{
+    echo "run_id: $RUN_ID"
+    echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "results: $RESULTS"
+    echo "work: $WORK"
+    echo "prompt: $PROMPT"
+    echo "kernel(s): ${kernels[*]}"
+    echo "models: ${ALIASES[*]}"
+    echo "command: $0 $*"
+} > "$RESULTS/RUN.txt"
 
 for k in "${kernels[@]}"; do
     kdir=$(find "$SUITE" -type d -name "$k" | head -1)
@@ -48,18 +68,28 @@ for k in "${kernels[@]}"; do
 
         gen="$WORK/${k}__${slug}.c"
         rm -f "$gen"
-        python3 "$ROOT/scripts/generate_asm.py" --kernel "$k" --src "$src" --out "$gen" \
-            --alias "$alias" --log "$RESULTS/llm_calls.jsonl" --prompt-template "$PROMPT" $dry
+        python3 "$ROOT/scripts/generate_with_repair.py" --kernel "$k" --src "$src" --out "$gen" \
+            --alias "$alias" --log "$RESULTS/llm_calls.jsonl" --prompt-template "$PROMPT" \
+            --work-dir "$WORK" --cc ia16-elf-gcc --polybench-c "$UTIL/polybench.c" --kernel-dir "$kdir" \
+            --extra-c-flags "-O0 -march=i8086 -mcmodel=small $flags" \
+            --exe "$WORK/${k}__${slug}.exe" --max-repairs "${MAX_REPAIRS:-2}" $dry
 
-        model=$(tail -1 "$RESULTS/llm_calls.jsonl" | python3 -c "import json,sys; print(json.load(sys.stdin)['underlying_model'])" | tr ',' ';')
-
-        if [ ! -f "$gen" ]; then
-            echo "$k,$alias,$model,no,api_error" >> "$SUMMARY"
+        st="$WORK/${k}__${slug}.status"
+        if [ ! -f "$st" ]; then
+            model=$(tail -1 "$RESULTS/llm_calls.jsonl" | python3 -c "import json,sys; print(json.load(sys.stdin).get('underlying_model','?'))" | tr ',' ';')
+            echo "$k,$alias,$model,no,api_error,0" >> "$SUMMARY"
             continue
         fi
+        read -r model compiled repairs <<< "$(python3 -c "import json,sys; d=json.load(open('$st')); print(d['underlying_model'] + ' yes ' + str(d['repairs']) if d['compiled'] else d['underlying_model'] + ' no ' + str(d['repairs']))")"
 
-        if ! ia16-elf-gcc -O0 -march=i8086 -mcmodel=small $flags -I "$kdir" "$UTIL/polybench.c" "$gen" -o "$WORK/${k}__${slug}.exe" 2>"$WORK/${k}__${slug}.compile_err.log"; then
-            echo "$k,$alias,$model,no,build_fail" >> "$SUMMARY"
+        # ship the generated code + snapshots + compile log with the results
+        cp -f "$gen" "$CODE/" 2>/dev/null
+        cp -f "$WORK/${k}__${slug}".attempt*.c "$CODE/" 2>/dev/null
+        cp -f "$WORK/${k}__${slug}".compile_err.log "$CODE/" 2>/dev/null
+        cp -f "$st" "$CODE/" 2>/dev/null
+
+        if [ "$compiled" != "yes" ]; then
+            echo "$k,$alias,$model,no,build_fail,$repairs" >> "$SUMMARY"
             continue
         fi
 
@@ -82,13 +112,17 @@ for k in "${kernels[@]}"; do
 
         out="$RESULTS/${k}__${slug}_8086.txt"
         if mcopy -i "$img@@$PART_OFFSET" "::OUTPUT.TXT" "$out" 2>/dev/null; then
-            diff -q "$native" "$out" >/dev/null && echo "$k,$alias,$model,yes,pass" >> "$SUMMARY" \
-                || echo "$k,$alias,$model,yes,mismatch" >> "$SUMMARY"
+            diff -q "$native" "$out" >/dev/null && echo "$k,$alias,$model,yes,pass,$repairs" >> "$SUMMARY" \
+                || echo "$k,$alias,$model,yes,mismatch,$repairs" >> "$SUMMARY"
         else
-            echo "$k,$alias,$model,yes,no_output" >> "$SUMMARY"
+            echo "$k,$alias,$model,yes,no_output,$repairs" >> "$SUMMARY"
         fi
     done
 done
 
 echo
 column -s, -t "$SUMMARY"
+echo
+echo "run saved in: $RESULTS"
+echo "funnel view:     python3 scripts/funnel.py \"8086=$RESULTS:$WORK:8086\""
+echo "repairs:         python3 scripts/report_repairs.py $RESULTS"

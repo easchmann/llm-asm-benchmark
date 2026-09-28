@@ -1,15 +1,17 @@
-# summarize results/comparison.csv + results/llm_calls.jsonl into a per-model table
+# summarize <run_dir>/comparison.csv + <run_dir>/llm_calls.jsonl into a per-model table
+# usage: python3 evaluate.py results/llm_compare_specific_20260928_1600
 
-import csv, json
+import csv, json, os, sys
 from collections import defaultdict
 
-rows = list(csv.DictReader(open("results/comparison.csv")))
+run_dir = sys.argv[1] if len(sys.argv) > 1 else "results"
+rows = list(csv.DictReader(open(os.path.join(run_dir, "comparison.csv"))))
 
 times = defaultdict(list)
 tokens = defaultdict(list)
 costs = defaultdict(list)
 last_key_spend = None
-for line in open("results/llm_calls.jsonl"):
+for line in open(os.path.join(run_dir, "llm_calls.jsonl")):
     d = json.loads(line)
     if not d["dry_run"]:
         times[d["alias_requested"]].append(d["elapsed_seconds"])

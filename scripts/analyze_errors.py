@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # check assembler/compiler/linker errors in each model's compile log
-# usage: python3 analyze_errors.py [work_dir](default: .work/llm_compare)
+# usage: python3 analyze_errors.py [run_dir|code_dir]
+#   (default: .work/llm_compare; a run dir's code/ is used when it has no .compile_err.log directly)
 
 import glob, os, re, sys
 from collections import Counter, defaultdict
 
 work = sys.argv[1] if len(sys.argv) > 1 else ".work/llm_compare"
+if not glob.glob(os.path.join(work, "*.compile_err.log")) and os.path.isdir(os.path.join(work, "code")):
+    work = os.path.join(work, "code")
 
 def messages(path):
     msgs, symbols = [], []

@@ -6,10 +6,19 @@
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUITE="$ROOT/kernels/polybench-c-4.2"
 UTIL="$SUITE/utilities"
-RESULTS="${X86_RESULTS:-$ROOT/results_x86}"
-WORK="${X86_WORK:-$ROOT/.work/x86}"
 PROMPT="${X86_PROMPT:-$ROOT/prompts/x86_64_prompt_template.txt}"
+
+# each invocation gets a fresh, never-reused run directory under results/
+RESULTS_BASE="${X86_RESULTS_BASE:-$ROOT/results}"
+BASE="x86"
+RUN_ID="${RUN_ID:-${BASE}_$(date +%Y%m%d_%H%M%S)}"
+n=0
+while [ -d "$RESULTS_BASE/$RUN_ID" ]; do n=$((n+1)); RUN_ID="${RUN_ID}-$n"; done
+RESULTS="$RESULTS_BASE/$RUN_ID"
+WORK="$ROOT/.work/$RUN_ID"
+CODE="$RESULTS/code"
 SUMMARY="$RESULTS/comparison.csv"
+mkdir -p "$RESULTS" "$WORK" "$CODE"
 
 # same models as the 8086 runs
 ALIASES=(RiVault/Reasoning-Tiny RiVault/Reasoning-Small RiVault/Reasoning-Medium RiVault/Reasoning-Large
@@ -32,9 +41,20 @@ kernels=()
 for a in "$@"; do [ "$a" = "--dry-run" ] && dry="--dry-run" || kernels+=("$a"); done
 [ ${#kernels[@]} -eq 0 ] && kernels=(atax bicg mvt)
 
-mkdir -p "$RESULTS" "$WORK"
-[ -f "$SUMMARY" ] || echo "kernel,alias,underlying_model,compiled,result" > "$SUMMARY"
+[ -f "$SUMMARY" ] || echo "kernel,alias,underlying_model,compiled,result,repairs" > "$SUMMARY"
 flags="-DMINI_DATASET -DPOLYBENCH_DUMP_ARRAYS -I $UTIL"
+
+# describe this run inside its own directory
+{
+    echo "run_id: $RUN_ID"
+    echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "results: $RESULTS"
+    echo "work: $WORK"
+    echo "prompt: $PROMPT"
+    echo "kernel(s): ${kernels[*]}"
+    echo "models: ${ALIASES[*]}"
+    echo "command: $0 $*"
+} > "$RESULTS/RUN.txt"
 
 for k in "${kernels[@]}"; do
     kdir=$(find "$SUITE" -type d -name "$k" | head -1)
@@ -58,22 +78,33 @@ for k in "${kernels[@]}"; do
 
         gen="$WORK/${k}__${slug}.c"
         rm -f "$gen"
-        python3 "$ROOT/scripts/generate_asm.py" --kernel "$k" --src "$src" --out "$gen" \
-            --alias "$alias" --log "$RESULTS/llm_calls.jsonl" --prompt-template "$PROMPT" $dry
+        python3 "$ROOT/scripts/generate_with_repair.py" --kernel "$k" --src "$src" --out "$gen" \
+            --alias "$alias" --log "$RESULTS/llm_calls.jsonl" --prompt-template "$PROMPT" \
+            --work-dir "$WORK" --cc gcc --polybench-c "$UTIL/polybench.c" --kernel-dir "$kdir" \
+            --extra-c-flags "$flags" --link-math \
+            --exe "$WORK/${k}__${slug}" --max-repairs "${MAX_REPAIRS:-2}" $dry
 
-        model=$(tail -1 "$RESULTS/llm_calls.jsonl" | python3 -c "import json,sys; print(json.load(sys.stdin)['underlying_model'])" | tr ',' ';')
+        st="$WORK/${k}__${slug}.status"
+        if [ ! -f "$st" ]; then
+            model=$(tail -1 "$RESULTS/llm_calls.jsonl" | python3 -c "import json,sys; print(json.load(sys.stdin).get('underlying_model','?'))" | tr ',' ';')
+            echo "$k,$alias,$model,no,api_error,0" >> "$SUMMARY"
+            continue
+        fi
+        read -r model compiled repairs <<< "$(python3 -c "import json,sys; d=json.load(open('$st')); print(d['underlying_model'] + ' yes ' + str(d['repairs']) if d['compiled'] else d['underlying_model'] + ' no ' + str(d['repairs']))")"
 
-        if [ ! -f "$gen" ]; then
-            echo "$k,$alias,$model,no,api_error" >> "$SUMMARY"
+        # ship the generated code + snapshots + compile log with the results
+        cp -f "$gen" "$CODE/" 2>/dev/null
+        cp -f "$WORK/${k}__${slug}".attempt*.c "$CODE/" 2>/dev/null
+        cp -f "$WORK/${k}__${slug}".compile_err.log "$CODE/" 2>/dev/null
+        cp -f "$st" "$CODE/" 2>/dev/null
+
+        if [ "$compiled" != "yes" ]; then
+            echo "$k,$alias,$model,no,build_fail,$repairs" >> "$SUMMARY"
             continue
         fi
 
         exe="$WORK/${k}__${slug}"
         out="$RESULTS/${k}__${slug}_x86.txt"
-        if ! gcc -O0 $flags -I "$kdir" "$UTIL/polybench.c" "$gen" -o "$exe" -lm 2>"$exe.compile_err.log"; then
-            echo "$k,$alias,$model,no,build_fail" >> "$SUMMARY"
-            continue
-        fi
 
         # runs model-written code natively, cap time, cpu, memory and output size
         ( ulimit -t 30 -v 4000000 -f 1000; timeout 15s "$exe" < /dev/null > "$out" 2> "$exe.run_err.log" )
@@ -85,11 +116,13 @@ for k in "${kernels[@]}"; do
         elif diff -q "$native" "$out" >/dev/null; then result=pass
         else result=mismatch
         fi
-        echo "$k,$alias,$model,yes,$result" >> "$SUMMARY"
+        echo "$k,$alias,$model,yes,$result,$repairs" >> "$SUMMARY"
     done
 done
 
 echo
 column -s, -t "$SUMMARY"
 echo
-echo "finer grading:  python3 scripts/classify_outputs.py $RESULTS x86"
+echo
+echo "funnel view:     python3 scripts/funnel.py \"x86=$RESULTS:$WORK:x86\""
+echo "repairs:         python3 scripts/report_repairs.py $RESULTS"

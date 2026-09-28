@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # for every model, how far did each run get?
 #   no_answer -> format -> c_syntax -> operands -> assembler -> link -> runtime -> wrong_output -> pass
-#   e.g. python3 funnel.py 8086=results:.work/llm_compare:8086 x86=results_x86:.work/x86:x86
+# Generates @code in `python3 scripts/funnel.py` ... `--` ... a run's own dir:
+#   python3 scripts/funnel.py 8086=results/llm_compare_specific_20260928_1600:8086 \
+#                             x86=results/x86_20260928_1700:x86
+# (generated code/snapshots are found in <run>/code/; `label=run:work:suffix` still works)
 
 import csv, json, os, re, sys
 from collections import Counter, defaultdict
@@ -105,7 +108,14 @@ def classify(row, results, work, suffix, calls):
 runs = []
 for arg in sys.argv[1:]:
     label, spec = arg.split("=", 1)
-    results, work, suffix = spec.split(":")
+    parts = spec.split(":")
+    if len(parts) == 2:
+        results, suffix = parts
+        work = os.path.join(results, "code")   # run dir layout: code lives in results/<run>/code/
+    elif len(parts) == 3:
+        results, work, suffix = parts          # legacy: results:work:suffix
+    else:
+        sys.exit(f"bad spec '{spec}' (want label=run[:work]:suffix)")
     csv_path = os.path.join(results, "comparison.csv")
     if not os.path.exists(csv_path):
         sys.exit(f"{csv_path} not found (looking from {os.getcwd()}) -- run from the repo root")
@@ -113,8 +123,9 @@ for arg in sys.argv[1:]:
     calls = [json.loads(l) for l in open(calls_path)] if os.path.exists(calls_path) else []
     runs.append((label, results, work, suffix, list(csv.DictReader(open(csv_path))), calls))
 if not runs:
-    sys.exit("usage: python3 funnel.py label=results_dir:work_dir:suffix [label=...]\n"
-             "  e.g. python3 funnel.py 8086=results:.work/llm_compare:8086 x86=results_x86:.work/x86:x86")
+    sys.exit("usage: python3 funnel.py label=results_run_dir[:work_dir]:suffix [label=...]\n"
+             "  e.g. python3 funnel.py 8086=results/llm_compare_20260928_1600:8086\n"
+             "            x86=results/x86_20260928_1700:x86")
 
 table = defaultdict(dict)  # (kernel, alias) -> label -> (stage, detail)
 counts = {label: Counter() for label, *_ in runs}
