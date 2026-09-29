@@ -71,10 +71,23 @@ def api_detail(calls, kernel, alias):
     return "no log entry"
 
 
+def _values_repairs(work, kernel, slug):
+    """values_repairs from the run's status file, if shipped (run_x86.sh copies it)."""
+    p = os.path.join(work, f"{kernel}__{slug}.status")
+    if not os.path.exists(p):
+        return 0
+    try:
+        import json
+        return int(json.load(open(p)).get("values_repairs") or 0)
+    except Exception:
+        return 0
+
+
 def classify(row, results, work, suffix, calls):
     kernel, alias, result = row["kernel"], row["alias"], row["result"]
     slug = alias.replace("/", "_")
     reg = region(os.path.join(work, f"{kernel}__{slug}.c"))
+    vr = _values_repairs(work, kernel, slug)
 
     if result == "api_error":
         return "no_answer", api_detail(calls, kernel, alias)
@@ -97,12 +110,13 @@ def classify(row, results, work, suffix, calls):
         return "runtime", result
     if result == "mismatch":
         out = os.path.join(results, f"{kernel}__{slug}_{suffix}.txt")
-        return "wrong_output", grade_output(out, os.path.join(results, f"{kernel}_native.txt"))
+        detail = grade_output(out, os.path.join(results, f"{kernel}_native.txt"))
+        return "wrong_output", (f"[values_repairs={vr}] " if vr else "") + detail
     if result == "pass":
         if reg is not None and (format_problem(reg) or re.search(r"(?m)^\s*(for|while)\s*\(", reg)):
-            return "pass_suspect", "passes, but no asm block or C loops left in place"
-        return "pass", "asm block present"
-    return "build_other", f"unknown result '{result}'"
+            return "pass_suspect", ("[values_repairs=%d] passes, but no asm block or C loops left in place" % vr)
+        return ("pass" if not vr else "pass"), ("[values_repairs=%d] asm block present" % vr) if vr else "asm block present"
+    return "build_other", "unknown result '%s'" % result
 
 
 runs = []
@@ -129,11 +143,14 @@ if not runs:
 
 table = defaultdict(dict)  # (kernel, alias) -> label -> (stage, detail)
 counts = {label: Counter() for label, *_ in runs}
+values_used = {label: 0 for label, *_ in runs}   # rows where a values-feedback turn ran
 for label, results, work, suffix, rows, calls in runs:
     for row in rows:
         stage, detail = classify(row, results, work, suffix, calls)
         table[(row["kernel"], row["alias"])][label] = (stage, detail)
         counts[label][stage] += 1
+        values_used[label] += int(_values_repairs(work, row["kernel"],
+                                                  row["alias"].replace("/", "_")) > 0)
 
 labels = [r[0] for r in runs]
 w = max(12, max(len(s) for s in ORDER) + 1)
@@ -141,7 +158,7 @@ print(f"{'kernel':<7} {'alias':<27}" + "".join(f"{l:<{w}}" for l in labels))
 for (kernel, alias), cells in sorted(table.items()):
     print(f"{kernel:<7} {alias:<27}" + "".join(f"{cells.get(l, ('-', ''))[0]:<{w}}" for l in labels))
 
-print("\n== details ==")
+print("\n== details (values_repairs=N marks rows that used the values-feedback stage) ==")
 for (kernel, alias), cells in sorted(table.items()):
     for l in labels:
         if l in cells:
@@ -152,3 +169,10 @@ print(f"{'stage':<14}" + "".join(f"{l:>{w}}" for l in labels))
 for stage in ORDER:
     if any(counts[l][stage] for l in labels):
         print(f"{stage:<14}" + "".join(f"{counts[l][stage]:>{w}}" for l in labels))
+
+# summary of values-feedback usage (from shipped status files)
+print("\nrows that used values-feedback (values_repairs>0):")
+if any(values_used[l] for l in labels):
+    print("".join(f"{l}: {values_used[l]}  " for l in labels))
+else:
+    print("  (none in any run)")

@@ -360,6 +360,20 @@ def main():
     # compiled binary AND we have a native reference and the run is native-executable
     # (x86). The 8086 path keeps running inside bash (qemu/FreeDOS), so the bash run
     # script simply does not pass --values-check for ia16-elf-gcc.
+    def _mismatch_indices(g):
+        """Ordered tuple of mismatching indices from a grade dict, robust to first_k
+        being tuples [(i, native, got), ...] (grade_outputs) or dicts [{i:..., ...}]."""
+        idxs = []
+        for it in (g.get("first_k") or []):
+            if isinstance(it, dict):
+                idxs.append(it["i"])
+            else:
+                idxs.append(it[0])          # tuple form
+        # length-mismatch branch emits only one representative entry; trust 'right' alone
+        if len(g.get("first_k") or []) == 1 and g.get("len_native") != g.get("len_got"):
+            return tuple()
+        return tuple(sorted(idxs))
+
     result = None        # filled only when values-check ran
     values_repairs = 0
     if compiled and args.values_check and args.native and not args.dry_run:
@@ -383,8 +397,7 @@ def main():
 
         while grade["result"] != "pass" and values_repairs < args.max_values_repairs:
             # stop if the mismatch signature is unchanged (no progress)
-            sig = (grade.get("right"),
-                   tuple(sorted(i["i"] for i in (grade.get("first_k") or []))))
+            sig = (grade.get("right"), _mismatch_indices(grade))
             if prev_grade_sig is not None and sig == prev_grade_sig \
                     and not args.no_stop_same_values:
                 print(f"[{args.kernel}] values round {values_repairs}: same mismatch as "
@@ -481,7 +494,13 @@ def _call(args, prompt, attempt, *, is_values=False):
         return llm_client.call_llm(args.alias, prompt, max_tokens=cap, timeout=args.timeout)
     except LlmError as e:
         print(f"[{args.kernel}] API call failed (attempt {attempt}): {e}")
-        append_call(args.log, error_record(args, attempt, e, is_values=is_values))
+        try:
+            append_call(args.log, error_record(args, attempt, e, is_values=is_values))
+        except Exception as log_e:
+            # a failed append must not mask the real error or kill the run's summary
+            # book-keeping; the bash wrapper falls back to api_error from the last
+            # jsonl line when no status file exists
+            print(f"[{args.kernel}] warning: could not log API error ({log_e})")
         sys.exit(1)
 
 

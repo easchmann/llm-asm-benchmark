@@ -24,6 +24,23 @@ RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 RETRY_BACKOFF_BASE = 2.0      # seconds, then doubled per attempt
 RETRY_BACKOFF_MAX = 12.0
 
+# Caps on error detail. An error message/body can be enormous (a page of compiler
+# diagnostics, an HTML error page, a long value-repair report, ...). On 2026-09-29
+# the x86 run died with a MemoryError while appending an error record (a large
+# detail was being json-dumped inside append_call), collapsing the whole run into
+# an api_error row. Truncate so error records stay bounded however pathological
+# the payload a gateway or model returns.
+ERROR_DETAIL_MAX = 400        # chars kept in LlmError messages / error records
+ERROR_BODY_MAX = 8192         # bytes read off an HTTP error response for usage
+
+
+def _clip_error(text, limit=ERROR_DETAIL_MAX):
+    """Truncate an error detail to a bounded size, keeping a marker + original length."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
 
 def _backoff(attempt):
     return min(RETRY_BACKOFF_BASE * (2 ** attempt), RETRY_BACKOFF_MAX) \
@@ -38,7 +55,9 @@ class LlmError(Exception):
 
     def __init__(self, message, *, usage=None, cost_usd=None, key_spend=None,
                  elapsed_seconds=None):
-        super().__init__(message)
+        # covers both the direct raise sites and the HTTPError-derived ones, so an
+        # oversized gateway body never ends up verbatim in an error record
+        super().__init__(_clip_error(message))
         self.usage = usage or {}
         self.cost_usd = cost_usd
         self.key_spend = key_spend
@@ -109,6 +128,15 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         except (TypeError, ValueError):
             return None
 
+    # A 4xx/5xx response body can be a megabyte of diagnostics/HTML. Read only a bounded
+    # prefix; the error message carries status, and usage is all we need from the body.
+    def try_usage(http_err):
+        try:
+            return json.loads(http_err.read(ERROR_BODY_MAX).decode("utf-8", "replace")
+                              or "{}").get("usage", {})
+        except Exception:
+            return {}
+
     def run_once(attempt):
         """Single HTTP round trip. Returns (resp_json, http_status, cost, key_spend,
         resolved_model) or raises LlmError for non-retryable / exhausted failures."""
@@ -119,22 +147,24 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
             headers = getattr(e, "headers", None)
             cost = to_float(headers.get("X-Litellm-Response-Cost")) if headers else None
             key_spend = to_float(headers.get("X-Litellm-Key-Spend")) if headers else None
-            try:
-                usage = json.loads(e.read().decode("utf-8", "replace") or "{}").get("usage", {})
-            except Exception:
-                usage = {}
+            # bounded read: the error body can be huge; we only want usage
+            usage = try_usage(e)
+            # Pass only the short status/reason so error records stay bounded; a
+            # verbose body would otherwise be pulled in wholesale.
+            detail = f"HTTP {status}: {e.reason}" if e.reason else f"HTTP {status}"
             if status in RETRYABLE_STATUS and attempt < MAX_RETRIES:
                 # let the retry loop handle it; carry cost so it's not lost on success
-                retryable = LlmError(str(e), usage=usage, cost_usd=cost,
+                retryable = LlmError(detail, usage=usage, cost_usd=cost,
                                      key_spend=key_spend)
                 raise _TransientError(retryable) from e
-            raise LlmError(f"HTTP {status}: {e}", usage=usage, cost_usd=cost,
+            raise LlmError(detail, usage=usage, cost_usd=cost,
                            key_spend=key_spend,
                            elapsed_seconds=round(time.time() - start, 1)) from e
         except Exception as e:   # urllib.error.URLError (timeout/conn), socket errors...
             if attempt < MAX_RETRIES:
                 # timeout / conn reset are transient -> retry; re-raise type via helper
-                raise _TransientError(LlmError(str(e), elapsed_seconds=round(time.time() - start, 1))) from e
+                raise _TransientError(LlmError(str(e),
+                                               elapsed_seconds=round(time.time() - start, 1))) from e
             raise LlmError(str(e), elapsed_seconds=round(time.time() - start, 1)) from e
 
         cost = to_float(http_resp.headers.get("X-Litellm-Response-Cost"))
@@ -292,7 +322,13 @@ def save_reasoning(log_path, kernel, slug, tag, reasoning):
 
 
 def append_call(log_path, fields):
-    """Append one call record to an llm_calls.jsonl log."""
+    """Append one call record to an llm_calls.jsonl log.
+
+    Serialize the full line before opening the file, then flush: a MemoryError while
+    building a record (e.g. an oversized error detail) fails before the file is touched,
+    and a later crash can't lose a buffered-but-unwritten line."""
+    line = json.dumps(fields) + "\n"
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     with open(log_path, "a") as f:
-        f.write(json.dumps(fields) + "\n")
+        f.write(line)
+        f.flush()

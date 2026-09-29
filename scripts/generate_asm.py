@@ -6,8 +6,8 @@ import json
 import os
 import sys
 
-from llm_client import (API_KEY, LlmError, build_prompt, call_llm, new_call_id,
-                        save_reasoning, split_scop, splice, strip_fences)
+from llm_client import (API_KEY, LlmError, build_prompt, call_llm, _clip_error,
+                        new_call_id, save_reasoning, split_scop, splice, strip_fences)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROMPT_FILE = os.path.join(HERE, "..", "prompts", "i8086_prompt_template.txt")
@@ -73,12 +73,13 @@ def main():
             cost = e.cost_usd
             key_spend = e.key_spend
             cost_str = f"${cost:.6f}" if cost is not None else "$?"
-            print(f"[{args.kernel}] call failed after {elapsed:.1f}s: {e}"
+            err_msg = _clip_error(e)
+            print(f"[{args.kernel}] call failed after {elapsed:.1f}s: {err_msg}"
                   + (f" -- usage: {usage}, cost: {cost_str}" if usage or cost else ""))
             os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
             with open(args.log, "a") as f:
                 f.write(json.dumps({"kernel": args.kernel, "alias_requested": args.alias,
-                                     "underlying_model": f"error: {e}", "dry_run": args.dry_run,
+                                     "underlying_model": f"error: {err_msg}", "dry_run": args.dry_run,
                                      "elapsed_seconds": round(elapsed, 1), "reasoning_file": None,
                                      "usage": usage, "max_tokens_requested": args.max_tokens,
                                      "cost_usd": cost, "key_spend_total_usd": key_spend,
