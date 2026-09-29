@@ -181,7 +181,10 @@ def main():
     p.add_argument("--exe", required=True)
     p.add_argument("--link-math", action="store_true")
     p.add_argument("--max-repairs", type=int, default=int(os.environ.get("MAX_REPAIRS", 2)))
-    p.add_argument("--repair-max-tokens", type=int, default=32768)
+    p.add_argument("--repair-max-tokens", type=int, default=None,
+                   help="cap for repair-turn output tokens (None = uncapped, like turn 0). "
+                        "Justified by logs: 32K caps made reasoning-chain repair calls "
+                        "return finish_reason=length with no content (wasted calls, api_error rows).")
     p.add_argument("--max-tokens", type=int, default=None, help="omit for no cap (initial call)")
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--dry-run", action="store_true")
