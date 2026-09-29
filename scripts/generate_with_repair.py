@@ -13,9 +13,11 @@ import sys
 import llm_client
 from llm_client import (API_KEY, LlmError, append_call, build_prompt, clean_region,
                         new_call_id, save_reasoning, split_scop, splice)
+import llm_runner
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_REPAIR_TEMPLATE = os.path.join(HERE, "..", "prompts", "repair_template.txt")
+DEFAULT_VALUES_REPAIR_TEMPLATE = os.path.join(HERE, "..", "prompts", "values_repair_template.txt")
 DEFAULT_PROMPT = os.path.join(HERE, "..", "prompts", "i8086_prompt_template.txt")
 
 # messages that mean "compiler rejected our asm" (mirrors funnel.py / analyze_errors.py)
@@ -49,6 +51,18 @@ def _cap(text, limit):
     if len(text) <= limit:
         return text
     return text[:limit] + "\n... [truncated]"
+
+
+def build_values_prompt(base_template_path, src, history, values_template_path,
+                        feedback_text, call_id):
+    """Compose the values-repair message: same base prompt plus a tail with the last
+    failed region and the output-mismatch report (not compiler errors). history holds
+    the region from the LAST successful compile; feedback_text is summarize_mismatch()."""
+    base = build_prompt(base_template_path, src, None)
+    tail = open(values_template_path).read()
+    tail = tail.replace("{{PREVIOUS_ASM}}", _cap(history[-1]["code"], 8192))
+    tail = tail.replace("{{VALUES_FEEDBACK}}", _cap(feedback_text, 4096))
+    return base + "\n\n" + tail + f"\n/* call-id: {call_id} */\n"
 
 
 # --- compiler-error extraction ------------------------------------------------
@@ -108,30 +122,33 @@ def run_compile(cc, flags, src, polybench_c, kernel_dir, out_exe, log_path, link
 
 # --- record/log helpers ---------------------------------------------------------
 
-def _max_tokens_for(args, attempt):
-    # attempt 0 uses args.max_tokens (may be None = no cap); repair turns use the
-    # fixed repair_max_tokens cap. Record what was actually sent to the API so the
-    # logs distinguish "hit the repair cap" from "was uncapped" (see 504/empty-content analysis).
+def _max_tokens_for(args, attempt, is_values=False):
+    # attempt 0 uses args.max_tokens (may be None = no cap); repair turns use
+    # repair_max_tokens; values-repair turns use values_repair_max_tokens. Record what
+    # was actually sent so logs distinguish "hit the cap" from "was uncapped".
+    if is_values:
+        return args.values_repair_max_tokens
     return args.max_tokens if attempt == 0 else args.repair_max_tokens
 
 
-def base_record(args, attempt, model, elapsed, reasoning_file):
+def base_record(args, attempt, model, elapsed, reasoning_file, is_values=False):
     return {"kernel": args.kernel,
             "alias_requested": args.alias,
             "underlying_model": model,
             "dry_run": args.dry_run,
             "elapsed_seconds": round(elapsed, 1),
             "reasoning_file": reasoning_file,
-            "max_tokens_requested": _max_tokens_for(args, attempt),
+            "max_tokens_requested": _max_tokens_for(args, attempt, is_values),
             "usage": {},
             "cost_usd": None,
             "key_spend_total_usd": None,
             "prompt_template": args.prompt_template,
             "repair_attempt": attempt,
-            "attempt_kind": "generate" if attempt == 0 else "repair"}
+            "attempt_kind": ("values_repair" if is_values
+                             else ("generate" if attempt == 0 else "repair"))}
 
 
-def error_record(args, attempt, err):
+def error_record(args, attempt, err, *, is_values=False):
     """JSONL line for a failed API call (no usable reply), mirrors generate_asm.py."""
     return {"kernel": args.kernel,
             "alias_requested": args.alias,
@@ -139,13 +156,14 @@ def error_record(args, attempt, err):
             "dry_run": args.dry_run,
             "elapsed_seconds": round(err.elapsed_seconds or 0, 1),
             "reasoning_file": None,
-            "max_tokens_requested": _max_tokens_for(args, attempt),
+            "max_tokens_requested": _max_tokens_for(args, attempt, is_values),
             "usage": err.usage or {},
             "cost_usd": err.cost_usd,
             "key_spend_total_usd": err.key_spend,
             "prompt_template": args.prompt_template,
             "repair_attempt": attempt,
-            "attempt_kind": "generate" if attempt == 0 else "repair"}
+            "attempt_kind": ("values_repair" if is_values
+                             else ("generate" if attempt == 0 else "repair"))}
 
 
 def write_calls(log_path, call_records, compiled):
@@ -181,6 +199,18 @@ def main():
     p.add_argument("--exe", required=True)
     p.add_argument("--link-math", action="store_true")
     p.add_argument("--max-repairs", type=int, default=int(os.environ.get("MAX_REPAIRS", 2)))
+    p.add_argument("--values-check", action="store_true",
+                   help="after a compile pass, run the binary against --native and repair "
+                        "on wrong output values (x86 path; 8086 stays in bash/qemu)")
+    p.add_argument("--native", default=None, help="native reference output file for values-check")
+    p.add_argument("--values-repair-template", default=DEFAULT_VALUES_REPAIR_TEMPLATE)
+    p.add_argument("--max-values-repairs", type=int,
+                   default=int(os.environ.get("MAX_VALUES_REPAIRS", "2")),
+                   help="how many wrong-output repair rounds to attempt (default 2)")
+    p.add_argument("--no-stop-same-values", action="store_true",
+                   help="do not stop when a values round repeats the previous mismatch signature")
+    p.add_argument("--values-repair-max-tokens", type=int, default=None,
+                   help="cap for values-repair output tokens (None = uncapped)")
     p.add_argument("--repair-max-tokens", type=int, default=None,
                    help="cap for repair-turn output tokens (None = uncapped, like turn 0). "
                         "Justified by logs: 32K caps made reasoning-chain repair calls "
@@ -326,26 +356,132 @@ def main():
             print(f"[{args.kernel}] repair budget exhausted ({args.max_repairs})")
             break
 
+    # --- values-feedback stage: only relevant when the error loop produced a
+    # compiled binary AND we have a native reference and the run is native-executable
+    # (x86). The 8086 path keeps running inside bash (qemu/FreeDOS), so the bash run
+    # script simply does not pass --values-check for ia16-elf-gcc.
+    result = None        # filled only when values-check ran
+    values_repairs = 0
+    if compiled and args.values_check and args.native and not args.dry_run:
+        run_err = os.path.join(args.work_dir, f"{args.kernel}__{slug_}.run_err.log")
+        with open(run_err, "a") as f:
+            f.write(f"=== {args.kernel}/{slug_} values-check run ===\n")
+
+        out_val = os.path.join(args.work_dir, f"{args.kernel}__{slug_}.values_check.txt")
+
+        def run_and_grade():
+            rc_v, to = llm_runner.run_binary(args.exe, out_val, run_err, timeout=args.timeout)
+            if to:
+                return {"result": "timeout"}
+            if rc_v != 0:
+                return {"result": "run_fail", "rc": rc_v}
+            return llm_runner.grade_outputs(args.native, out_val)
+
+        grade = run_and_grade()
+        prev_grade_sig = None
+        last_good_code = replacement        # the region that just compiled in the error loop
+
+        while grade["result"] != "pass" and values_repairs < args.max_values_repairs:
+            # stop if the mismatch signature is unchanged (no progress)
+            sig = (grade.get("right"),
+                   tuple(sorted(i["i"] for i in (grade.get("first_k") or []))))
+            if prev_grade_sig is not None and sig == prev_grade_sig \
+                    and not args.no_stop_same_values:
+                print(f"[{args.kernel}] values round {values_repairs}: same mismatch as "
+                      "previous round, stopping (no progress)")
+                break
+            prev_grade_sig = sig
+            feedback = llm_runner.summarize_mismatch(grade)
+
+            v_attempt = repairs + 1 + values_repairs   # continuing attempt numbering
+            if args.dry_run:
+                content = last_good_code
+                model, elapsed, reasoning = "dry-run", 0, None
+            else:
+                call_id = new_call_id()
+                prompt = build_values_prompt(args.prompt_template, src,
+                                             [{"code": last_good_code, "errors": feedback}],
+                                             args.values_repair_template, feedback, call_id)
+                print(f"[{args.kernel}] calling {args.alias} (values-repair "
+                      f"{values_repairs + 1}) ...")
+                r = _call(args, prompt, v_attempt)
+                model, elapsed, reasoning = (r["underlying_model"], r["elapsed_seconds"],
+                                             r["reasoning"])
+                last_model = model
+                content = r["content"]
+
+            reasoning_file = save_reasoning(args.log, args.kernel, slug_,
+                                            f"values{values_repairs}", reasoning)
+            rec = base_record(args, v_attempt, model, elapsed, reasoning_file, is_values=True)
+            if not args.dry_run:
+                rec.update({"usage": r.get("usage", {}),
+                            "cost_usd": r.get("cost_usd"),
+                            "key_spend_total_usd": r.get("key_spend_total_usd")})
+            rec["values_round"] = values_repairs
+            rec["repair_extracted"] = True
+
+            replacement_v = clean_region(content) if not args.dry_run else content.strip()
+            if replacement_v is None:
+                print(f"[{args.kernel}] values round {values_repairs}: no usable asm block "
+                      "extracted, stopping")
+                rec["repair_extracted"] = False
+                call_records.append(rec)
+                break
+
+            call_records.append(rec)
+            values_repairs += 1
+
+            gen_src = splice(before, replacement_v, after)
+            with open(args.out, "w") as f:
+                f.write(gen_src)
+            v_snapshot = os.path.join(args.work_dir,
+                                      f"{args.kernel}__{slug_}.values{values_repairs}.c")
+            with open(v_snapshot, "w") as f:
+                f.write(gen_src)
+
+            if not args.dry_run:
+                rc = run_compile(cc, args.extra_c_flags, v_snapshot, args.polybench_c,
+                                 args.kernel_dir, args.exe, compile_log,
+                                 args.link_math, timeout=args.timeout)
+            else:
+                rc = 0
+            if rc != 0:
+                # values-repair regressed the build; keep the last working binary, note it
+                print(f"[{args.kernel}] values round {values_repairs}: recompile failed, "
+                      "keeping last working version")
+                break
+
+            grade = run_and_grade()
+            last_good_code = replacement_v
+
+        result = grade["result"] if isinstance(grade, dict) else "unknown"
+
     write_calls(args.log, call_records, compiled)
     write_status(status_path, {"kernel": args.kernel,
                                "alias_requested": args.alias,
                                "underlying_model": last_model,
                                "compiled": compiled,
                                "repairs": repairs,
+                               "values_repairs": values_repairs,
+                               "result": result,
                                "compile_log": compile_log})
-    print(f"[{args.kernel}] finished: compiled={compiled} repairs={repairs}")
+    print(f"[{args.kernel}] finished: compiled={compiled} repairs={repairs} "
+          f"values_repairs={values_repairs} result={result}")
 
 
-def _call(args, prompt, attempt):
+def _call(args, prompt, attempt, *, is_values=False):
     """One real LLM call. On failure, log the error entry and exit so bash records api_error."""
+    if is_values:
+        cap = args.values_repair_max_tokens
+    elif attempt == 0:
+        cap = args.max_tokens
+    else:
+        cap = args.repair_max_tokens
     try:
-        return llm_client.call_llm(args.alias, prompt,
-                                   max_tokens=(args.max_tokens if attempt == 0
-                                               else args.repair_max_tokens),
-                                   timeout=args.timeout)
+        return llm_client.call_llm(args.alias, prompt, max_tokens=cap, timeout=args.timeout)
     except LlmError as e:
         print(f"[{args.kernel}] API call failed (attempt {attempt}): {e}")
-        append_call(args.log, error_record(args, attempt, e))
+        append_call(args.log, error_record(args, attempt, e, is_values=is_values))
         sys.exit(1)
 
 

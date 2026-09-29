@@ -78,11 +78,20 @@ for k in "${kernels[@]}"; do
 
         gen="$WORK/${k}__${slug}.c"
         rm -f "$gen"
+        # --values-check: after a compile-pass the Python loop itself runs+grades (against
+        # native) and repairs wrong OUTPUT values (not just compiler errors). 8086 path
+        # does NOT pass this (its run is qemu/FreeDOS inside bash) and keeps bash grading.
+        # On by default for x86 ("1"); set X86_VALUES_CHECK=0 to disable.
+        values_args=""
+        if [ "${X86_VALUES_CHECK:-1}" != "0" ]; then
+            values_args="--values-check --native $native"
+        fi
         python3 "$ROOT/scripts/generate_with_repair.py" --kernel "$k" --src "$src" --out "$gen" \
             --alias "$alias" --log "$RESULTS/llm_calls.jsonl" --prompt-template "$PROMPT" \
             --work-dir "$WORK" --cc gcc --polybench-c "$UTIL/polybench.c" --kernel-dir "$kdir" \
             --extra-c-flags "$flags" --link-math \
-            --exe "$WORK/${k}__${slug}" --max-repairs "${MAX_REPAIRS:-2}" $dry
+            --exe "$WORK/${k}__${slug}" --max-repairs "${MAX_REPAIRS:-2}" \
+            --max-values-repairs "${MAX_VALUES_REPAIRS:-2}" ${values_args:+$values_args} $dry
 
         st="$WORK/${k}__${slug}.status"
         if [ ! -f "$st" ]; then
@@ -90,11 +99,27 @@ for k in "${kernels[@]}"; do
             echo "$k,$alias,$model,no,api_error,0" >> "$SUMMARY"
             continue
         fi
-        read -r model compiled repairs <<< "$(python3 -c "import json,sys; d=json.load(open('$st')); print(d['underlying_model'] + ' yes ' + str(d['repairs']) if d['compiled'] else d['underlying_model'] + ' no ' + str(d['repairs']))")"
+        vcheck="${X86_VALUES_CHECK:-1}"
+        read -r model compiled repairs raw_result <<< "$(python3 -c "
+import json,sys
+d=json.load(open('$st'))
+if d['compiled']:
+    print(d['underlying_model'], 'yes', d['repairs'], d.get('result') or '')
+else:
+    print(d['underlying_model'], 'no', d['repairs'])")"
+        # When values-check ran, the Python loop already graded -> trust its result
+        # (pass/mismatch/empty/no_output/timeout/run_fail). Otherwise fall back to bash grading.
+        if [ "$vcheck" != "0" ] && [ "$compiled" = "yes" ]; then
+            result="$raw_result"
+            [ -z "$result" ] || [ "$result" = "None" ] && result="run_fail"
+        else
+            result=""
+        fi
 
-        # ship the generated code + snapshots + compile log with the results
+        # ship the generated code + snapshots + compile log + (values snapshots) with the results
         cp -f "$gen" "$CODE/" 2>/dev/null
         cp -f "$WORK/${k}__${slug}".attempt*.c "$CODE/" 2>/dev/null
+        cp -f "$WORK/${k}__${slug}".values*.c "$CODE/" 2>/dev/null
         cp -f "$WORK/${k}__${slug}".compile_err.log "$CODE/" 2>/dev/null
         cp -f "$st" "$CODE/" 2>/dev/null
 
@@ -106,15 +131,23 @@ for k in "${kernels[@]}"; do
         exe="$WORK/${k}__${slug}"
         out="$RESULTS/${k}__${slug}_x86.txt"
 
-        # runs model-written code natively, cap time, cpu, memory and output size
-        ( ulimit -t 30 -v 4000000 -f 1000; timeout 15s "$exe" < /dev/null > "$out" 2> "$exe.run_err.log" )
-        rc=$?
-        echo "exit code $rc" >> "$exe.run_err.log"
-
-        if [ $rc -eq 124 ]; then result=timeout
-        elif [ $rc -ne 0 ]; then result=run_fail
-        elif diff -q "$native" "$out" >/dev/null; then result=pass
-        else result=mismatch
+        # fallback (values-check disabled, or no status result): run + grade here as before
+        if [ -z "$result" ]; then
+            # prefer Python's pre-captured values_check.txt (from the values loop) if present
+            rc=""
+            if [ -s "$WORK/${k}__${slug}.values_check.txt" ]; then
+                cp -f "$WORK/${k}__${slug}.values_check.txt" "$out"
+                rc=0   # it ran successfully inside Python
+            else
+                ( ulimit -t 30 -v 4000000 -f 1000; timeout 15s "$exe" < /dev/null > "$out" 2> "$exe.run_err.log" )
+                rc=$?
+                echo "exit code $rc" >> "$exe.run_err.log"
+            fi
+            if [ "$rc" -eq 124 ]; then result=timeout
+            elif [ "$rc" -ne 0 ]; then result=run_fail
+            elif diff -q "$native" "$out" >/dev/null; then result=pass
+            else result=mismatch
+            fi
         fi
         echo "$k,$alias,$model,yes,$result,$repairs" >> "$SUMMARY"
     done
