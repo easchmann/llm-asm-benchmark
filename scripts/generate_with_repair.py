@@ -108,6 +108,13 @@ def run_compile(cc, flags, src, polybench_c, kernel_dir, out_exe, log_path, link
 
 # --- record/log helpers ---------------------------------------------------------
 
+def _max_tokens_for(args, attempt):
+    # attempt 0 uses args.max_tokens (may be None = no cap); repair turns use the
+    # fixed repair_max_tokens cap. Record what was actually sent to the API so the
+    # logs distinguish "hit the repair cap" from "was uncapped" (see 504/empty-content analysis).
+    return args.max_tokens if attempt == 0 else args.repair_max_tokens
+
+
 def base_record(args, attempt, model, elapsed, reasoning_file):
     return {"kernel": args.kernel,
             "alias_requested": args.alias,
@@ -115,7 +122,7 @@ def base_record(args, attempt, model, elapsed, reasoning_file):
             "dry_run": args.dry_run,
             "elapsed_seconds": round(elapsed, 1),
             "reasoning_file": reasoning_file,
-            "max_tokens_requested": args.max_tokens,
+            "max_tokens_requested": _max_tokens_for(args, attempt),
             "usage": {},
             "cost_usd": None,
             "key_spend_total_usd": None,
@@ -132,7 +139,7 @@ def error_record(args, attempt, err):
             "dry_run": args.dry_run,
             "elapsed_seconds": round(err.elapsed_seconds or 0, 1),
             "reasoning_file": None,
-            "max_tokens_requested": args.max_tokens,
+            "max_tokens_requested": _max_tokens_for(args, attempt),
             "usage": err.usage or {},
             "cost_usd": err.cost_usd,
             "key_spend_total_usd": err.key_spend,
