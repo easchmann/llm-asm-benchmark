@@ -20,11 +20,30 @@ CODE="$RESULTS/code"
 SUMMARY="$RESULTS/comparison.csv"
 mkdir -p "$RESULTS" "$WORK" "$CODE"
 
-# same models as the 8086 runs
-ALIASES=(RiVault/Reasoning-Tiny RiVault/Reasoning-Small RiVault/Reasoning-Medium RiVault/Reasoning-Large
-         RiVault/Instruction-Tiny RiVault/Instruction-Small RiVault/Instruction-Medium
-         RiVault/Agentic-Small RiVault/Agentic-Medium)
-[ -n "$X86_ALIASES" ] && read -ra ALIASES <<< "$X86_ALIASES"
+# Exact models by five categories (queried directly, no RiVault alias indirection).
+# Deduped to distinct underlying backends (route probed 2026-09-29): DeepSeek-V4-Flash
+# and DeepSeek-V4-Flash-reasoning resolve to the SAME vLLM backend, so the latter was
+# replaced with moonshotai/Kimi-K3 (litellm_proxy/kimi-k3), a genuinely distinct backend.
+# category is a label; model is the exact gateway id.
+# Each element: "category:exact_model_id"
+CATEGORY_MODELS=(
+"Reasoning-Small:Qwen/Qwen3.8-27B"
+"Reasoning-Medium:deepseek-ai/DeepSeek-V4-Flash"
+"Reasoning-Medium:moonshotai/Kimi-K3"
+"Reasoning-Large:zai-org/GLM-5.3-Flash"
+"Reasoning-Large:zai-org/GLM-5.2"
+"Agentic-Small:Qwen/Qwen3.6-35B-A3B"
+)
+# Override: `X86_MODELS="cat:model cat:model ..."`
+[ -n "$X86_MODELS" ] && read -ra CATEGORY_MODELS <<< "$X86_MODELS"
+
+# sort into parallel arrays: MODEL[] id, CAT[] category
+unset ALIASES CATS
+declare -a ALIASES CATS
+for pair in "${CATEGORY_MODELS[@]}"; do
+    cat="${pair%%:*}"; model="${pair#*:}"
+    ALIASES+=("$model"); CATS+=("$cat")
+done
 
 # run on x86 node only
 if [ "$(uname -m)" != "x86_64" ]; then
@@ -41,7 +60,32 @@ kernels=()
 for a in "$@"; do [ "$a" = "--dry-run" ] && dry="--dry-run" || kernels+=("$a"); done
 [ ${#kernels[@]} -eq 0 ] && kernels=(atax bicg mvt)
 
-[ -f "$SUMMARY" ] || echo "kernel,alias,underlying_model,compiled,result,repairs" > "$SUMMARY"
+# Repeated measures: X86_REPEATS>1 re-runs the whole grid N times into sibling
+# <run_id>_r<NN> dirs under results/<base>_repeats/ (each repeat a full, independent
+# run: own route snapshot, native build, status/JSONL) then aggregates them into a
+# majority vote via scripts/aggregate_repeats.py. The gateway seeds per call, so
+# repeats are independent draws. Chosen because within-cell variance is the dominant
+# noise source (the two 2026-09-29 runs flipped 10/15 kept-model cells).
+REPEATS="${X86_REPEATS:-1}"
+if [ "$REPEATS" -gt 1 ] && [ "${X86_INNER:-0}" != "1" ]; then
+    TS=$(date +%Y%m%d_%H%M%S)
+    PARENT="$RESULTS_BASE/x86_${TS}_repeats"
+    mkdir -p "$PARENT"
+    for r in $(seq -w 1 "$REPEATS"); do
+        echo "=== repeat $r / $REPEATS -> $(basename "$PARENT")/r$r ==="
+        X86_INNER=1 X86_RESULTS_BASE="$PARENT" RUN_ID="x86_${TS}_r${r}" "$0" "$@"
+    done
+    echo
+    echo "=== repeated-measures summary ==="
+    if python3 "$ROOT/scripts/aggregate_repeats.py" "$PARENT" --out "$PARENT/repeated.csv"; then
+        echo "aggregate: $PARENT/repeated.csv"
+    else
+        echo "(aggregation failed)"
+    fi
+    exit $?
+fi
+
+[ -f "$SUMMARY" ] || echo "kernel,alias,category,compiled,result,repairs" > "$SUMMARY"
 flags="-DMINI_DATASET -DPOLYBENCH_DUMP_ARRAYS -I $UTIL"
 
 # describe this run inside its own directory
@@ -54,7 +98,19 @@ flags="-DMINI_DATASET -DPOLYBENCH_DUMP_ARRAYS -I $UTIL"
     echo "kernel(s): ${kernels[*]}"
     echo "models: ${ALIASES[*]}"
     echo "command: $0 $*"
+    [ "${X86_INNER:-0}" = "1" ] && echo "repeat: ${X86_REPEAT_LABEL:-$(basename "$RESULTS")}"
 } > "$RESULTS/RUN.txt"
+
+# Snapshot the gateway-resolved routing once at start, so a change mid-run (the
+# observed confound: same alias resolving to different models across runs) can be
+# detected and every result cited with its true model.
+ROUTE_REV="${ROUTE_REV:-$(date +%Y%m%d_%H%M%S)}"
+echo "route_rev: $ROUTE_REV" >> "$RESULTS/RUN.txt"
+if [ "${X86_SNAPSHOT_ROUTES:-1}" != "0" ]; then
+    echo "alias\tresolved_model (snapshot @ $ROUTE_REV)" >> "$RESULTS/RUN.txt"
+    python3 "$ROOT/scripts/llm_client.py" --resolve "${ALIASES[@]}" 2>/dev/null \
+        >> "$RESULTS/RUN.txt" || echo "(route snapshot unavailable)" >> "$RESULTS/RUN.txt"
+fi
 
 for k in "${kernels[@]}"; do
     kdir=$(find "$SUITE" -type d -name "$k" | head -1)
@@ -67,14 +123,16 @@ for k in "${kernels[@]}"; do
         "$WORK/${k}_native" > "$native"
     fi
 
-    for alias in "${ALIASES[@]}"; do
+    for i in "${!ALIASES[@]}"; do
+        alias="${ALIASES[$i]}"
+        category="${CATS[$i]}"
         slug=$(echo "$alias" | tr '/' '_')
 
-        if grep -q "^$k,$alias," "$SUMMARY" 2>/dev/null; then
-            echo "=== $k / $alias (already done, skipping) ==="
+        if grep -q "^$k,$category,$alias," "$SUMMARY" 2>/dev/null; then
+            echo "=== $k / $category / $alias (already done, skipping) ==="
             continue
         fi
-        echo "=== $k / $alias ==="
+        echo "=== $k / $category / $alias ==="
 
         gen="$WORK/${k}__${slug}.c"
         rm -f "$gen"
@@ -96,7 +154,7 @@ for k in "${kernels[@]}"; do
         st="$WORK/${k}__${slug}.status"
         if [ ! -f "$st" ]; then
             model=$(tail -1 "$RESULTS/llm_calls.jsonl" | python3 -c "import json,sys; print(json.load(sys.stdin).get('underlying_model','?'))" | tr ',' ';')
-            echo "$k,$alias,$model,no,api_error,0" >> "$SUMMARY"
+            echo "$k,$alias,$category,no,api_error,0" >> "$SUMMARY"
             continue
         fi
         vcheck="${X86_VALUES_CHECK:-1}"
@@ -124,7 +182,7 @@ else:
         cp -f "$st" "$CODE/" 2>/dev/null
 
         if [ "$compiled" != "yes" ]; then
-            echo "$k,$alias,$model,no,build_fail,$repairs" >> "$SUMMARY"
+            echo "$k,$alias,$category,no,build_fail,$repairs" >> "$SUMMARY"
             continue
         fi
 
@@ -149,7 +207,7 @@ else:
             else result=mismatch
             fi
         fi
-        echo "$k,$alias,$model,yes,$result,$repairs" >> "$SUMMARY"
+        echo "$k,$alias,$category,$compiled,$result,$repairs" >> "$SUMMARY"
     done
 done
 

@@ -68,11 +68,21 @@ for k in "${kernels[@]}"; do
 
         gen="$WORK/${k}__${slug}.c"
         rm -f "$gen"
+        # 8086 values-feedback: after a compile-pass the Python loop boots the .exe under
+        # FreeDOS/qemu itself (--runner dos), grades output vs native, and repairs WRONG
+        # VALUES (not just compiler errors). On by default ("1"); set I8086_VALUES_CHECK=0
+        # to disable and fall back to a single bash qemu boot per row (original behaviour).
+        values_args=""
+        if [ "${I8086_VALUES_CHECK:-1}" != "0" ]; then
+            values_args="--values-check --runner dos --native $native \
+--dos-floppy-image $FREEDOS_IMG --dos-part-offset $PART_OFFSET"
+        fi
         python3 "$ROOT/scripts/generate_with_repair.py" --kernel "$k" --src "$src" --out "$gen" \
             --alias "$alias" --log "$RESULTS/llm_calls.jsonl" --prompt-template "$PROMPT" \
             --work-dir "$WORK" --cc ia16-elf-gcc --polybench-c "$UTIL/polybench.c" --kernel-dir "$kdir" \
             --extra-c-flags "-O0 -march=i8086 -mcmodel=small $flags" \
-            --exe "$WORK/${k}__${slug}.exe" --max-repairs "${MAX_REPAIRS:-2}" $dry
+            --exe "$WORK/${k}__${slug}.exe" --max-repairs "${MAX_REPAIRS:-2}" \
+            --max-values-repairs "${MAX_VALUES_REPAIRS:-2}" ${values_args:+$values_args} $dry
 
         st="$WORK/${k}__${slug}.status"
         if [ ! -f "$st" ]; then
@@ -80,11 +90,26 @@ for k in "${kernels[@]}"; do
             echo "$k,$alias,$model,no,api_error,0" >> "$SUMMARY"
             continue
         fi
-        read -r model compiled repairs <<< "$(python3 -c "import json,sys; d=json.load(open('$st')); print(d['underlying_model'] + ' yes ' + str(d['repairs']) if d['compiled'] else d['underlying_model'] + ' no ' + str(d['repairs']))")"
+        vcheck="${I8086_VALUES_CHECK:-1}"
+        read -r model compiled repairs raw_result <<< "$(python3 -c "
+import json,sys
+d=json.load(open('$st'))
+if d['compiled']:
+    print(d['underlying_model'], 'yes', d['repairs'], d.get('result') or '')
+else:
+    print(d['underlying_model'], 'no', d['repairs'])")"
+        # When the Python values-check ran, it already graded -> trust its result
+        # (pass/mismatch/no_output/run_fail/timeout). blank -> fall back to bash grading.
+        result=""
+        if [ "$vcheck" != "0" ] && [ "$compiled" = "yes" ]; then
+            result="$raw_result"
+            [ -z "$result" ] || [ "$result" = "None" ] && result="run_fail"
+        fi
 
-        # ship the generated code + snapshots + compile log with the results
+        # ship the generated code + snapshots + compile log + (values snapshots) with results
         cp -f "$gen" "$CODE/" 2>/dev/null
         cp -f "$WORK/${k}__${slug}".attempt*.c "$CODE/" 2>/dev/null
+        cp -f "$WORK/${k}__${slug}".values*.c "$CODE/" 2>/dev/null
         cp -f "$WORK/${k}__${slug}".compile_err.log "$CODE/" 2>/dev/null
         cp -f "$st" "$CODE/" 2>/dev/null
 
@@ -93,30 +118,40 @@ for k in "${kernels[@]}"; do
             continue
         fi
 
-        img="$WORK/${k}__${slug}.img"
-        cp "$FREEDOS_IMG" "$img"
-        name=$(echo "$k" | tr a-z A-Z | cut -c1-8).EXE
-        mcopy -o -i "$img@@$PART_OFFSET" "$WORK/${k}__${slug}.exe" "::$name"
-        printf "%s > OUTPUT.TXT\nPOWEROFF\n" "$name" > "$WORK/${k}__${slug}.bat"
-        mcopy -o -i "$img@@$PART_OFFSET" "$WORK/${k}__${slug}.bat" "::FDAUTO.BAT"
-        mcopy -o -i "$img@@$PART_OFFSET" "$WORK/${k}__${slug}.bat" "::AUTOEXEC.BAT"
+        # Fallback: original single bash qemu boot + diff, used only when the Python
+        # values-loop is disabled (I8086_VALUES_CHECK=0) -> graded in bash.
+        if [ -z "$result" ]; then
+            img="$WORK/${k}__${slug}.img"
+            cp "$FREEDOS_IMG" "$img"
+            name=$(echo "$k" | tr a-z A-Z | cut -c1-8).EXE
+            mcopy -o -i "$img@@$PART_OFFSET" "$WORK/${k}__${slug}.exe" "::$name"
+            printf "%s > OUTPUT.TXT\nPOWEROFF\n" "$name" > "$WORK/${k}__${slug}.bat"
+            mcopy -o -i "$img@@$PART_OFFSET" "$WORK/${k}__${slug}.bat" "::FDAUTO.BAT"
+            mcopy -o -i "$img@@$PART_OFFSET" "$WORK/${k}__${slug}.bat" "::AUTOEXEC.BAT"
 
-        qemu-system-i386 -drive file="$img",format=raw,if=ide -boot c -nographic -no-reboot \
-            -monitor telnet:127.0.0.1:4444,server,nowait < /dev/null > "$WORK/${k}__${slug}.log" 2>&1 &
-        qemu_pid=$!
-        sleep 10
-        exec 3<>/dev/tcp/127.0.0.1/4444
-        echo "quit" >&3
-        exec 3<&-
-        wait "$qemu_pid" 2>/dev/null
+            qemu-system-i386 -drive file="$img",format=raw,if=ide -boot c -nographic -no-reboot \
+                -monitor telnet:127.0.0.1:4444,server,nowait < /dev/null > "$WORK/${k}__${slug}.log" 2>&1 &
+            qemu_pid=$!
+            sleep 10
+            exec 3<>/dev/tcp/127.0.0.1/4444
+            echo "quit" >&3
+            exec 3<&-
+            wait "$qemu_pid" 2>/dev/null
 
-        out="$RESULTS/${k}__${slug}_8086.txt"
-        if mcopy -i "$img@@$PART_OFFSET" "::OUTPUT.TXT" "$out" 2>/dev/null; then
-            diff -q "$native" "$out" >/dev/null && echo "$k,$alias,$model,yes,pass,$repairs" >> "$SUMMARY" \
-                || echo "$k,$alias,$model,yes,mismatch,$repairs" >> "$SUMMARY"
-        else
-            echo "$k,$alias,$model,yes,no_output,$repairs" >> "$SUMMARY"
+            out="$RESULTS/${k}__${slug}_8086.txt"
+            if mcopy -i "$img@@$PART_OFFSET" "::OUTPUT.TXT" "$out" 2>/dev/null; then
+                diff -q "$native" "$out" >/dev/null && result=pass || result=mismatch
+            else
+                result=no_output
+            fi
         fi
+
+        # make sure the last-graded output is shipped as <kernel>__<alias>_8086.txt
+        out="$RESULTS/${k}__${slug}_8086.txt"
+        if [ -s "$WORK/${k}__${slug}.values_check.txt" ]; then
+            cp -f "$WORK/${k}__${slug}.values_check.txt" "$out"
+        fi
+        echo "$k,$alias,$model,yes,$result,$repairs" >> "$SUMMARY"
     done
 done
 

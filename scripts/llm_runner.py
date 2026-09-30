@@ -36,30 +36,62 @@ def values(path):
     return [float(x) for b in blocks for x in NUM_RE.findall(b)]
 
 
+def _sandbox_preexec(cpu_s, mem_kb, out_kb):
+    """preexec_fn for subprocess.Popen: apply the run sandbox in the CHILD only.
+
+    Mirrors run_x86.sh's `ulimit -t 30 -v 4000000 -f 1000` in the spawned binary:
+      cpu_s   - CPU seconds (RLIMIT_CPU)
+      mem_kb  - virtual address space in KiB (RLIMIT_AS; bash -v is in KiB)
+      out_kb  - max output file size in KiB (RLIMIT_FSIZE)
+    The first arg (unlimited) is the hard limit, which must be set BEFORE dropping the
+    soft limit on 'v'/'f' so a non-root process may lower it (mirrors the bash parent).
+    Runs as the real child, so it never caps the long-lived Python orchestrator."""
+    import resource
+    r_soft = {"t": cpu_s, "v": mem_kb * 1024, "f": out_kb * 1024}
+    w = {"t": resource.RLIMIT_CPU, "v": resource.RLIMIT_AS, "f": resource.RLIMIT_FSIZE}
+    for key in ("v", "f"):
+        try:
+            resource.setrlimit(w[key], (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+        except (ValueError, OSError):
+            pass  # best effort — don't fail the run because we couldn't raise the hard limit
+    for key, lim in w.items():
+        try:
+            resource.setrlimit(lim, (r_soft[key], r_soft[key]))
+        except (ValueError, OSError):
+            pass  # best effort — don't fail the run because we couldn't sandbox
+
+
 def run_binary(exe, out_path, err_log, timeout=15, cpu=30, mem_mb=4000, out_kb=1000):
     """Run a native binary under the same sandbox bash uses (run_x86.sh), capturing
     stdout to out_path. Returns (returncode, timed_out). Mirrors:
         ( ulimit -t 30 -v 4000000 -f 1000; timeout 15s "$exe" ... )
+
+    The limits are applied ONLY to the child (preexec_fn), so the long-lived Python
+    orchestrator keeps its own (unlimited) address space — the old code wrongly set
+    RLIMIT_AS on the Python process in BYTES (mem_mb*1024 ≈ 4MB, off by ~1000x from
+    bash's KiB), which made every subsequent allocation in the run fail with
+    MemoryError (seen on 2026-09-29 in subprocess.run's timeout-read and append_call).
     """
     if os.path.exists(out_path):
         os.remove(out_path)
     try:
-        import resource
-        which = {"t": resource.RLIMIT_CPU, "v": resource.RLIMIT_AS,
-                 "f": resource.RLIMIT_FSIZE}
-        for limit, val in (("t", cpu), ("v", mem_mb * 1024), ("f", out_kb * 1024)):
-            try:
-                # relative hard-limit drop only for 'v'/'f' (allowed without root when
-                # the current hard limit is already lower); CPU is advisory.
-                resource.setrlimit(which[limit], (val, val))
-            except (ValueError, OSError):
-                pass  # best effort — don't fail the run because we couldn't sandbox
+        import resource  # noqa: F401  (probe once; preexec_fn runs in the child)
     except ImportError:
-        pass  # no resource module (non-POSIX); run unsandboxed
+        # non-POSIX without resource: no sandbox possible, run unsandboxed
+        try:
+            with open(out_path, "w") as outf, open(err_log, "a") as errf:
+                proc = subprocess.run([exe], stdin=subprocess.DEVNULL, stdout=outf,
+                                      stderr=errf, timeout=timeout)
+            return proc.returncode, False
+        except subprocess.TimeoutExpired:
+            with open(err_log, "a") as errf:
+                errf.write("\n[run timed out after %ss]\n" % timeout)
+            return 124, True
+    preexec = _sandbox_preexec(cpu, mem_mb * 1024, out_kb * 1024)
     try:
         with open(out_path, "w") as outf, open(err_log, "a") as errf:
             proc = subprocess.run([exe], stdin=subprocess.DEVNULL, stdout=outf,
-                                  stderr=errf, timeout=timeout)
+                                  stderr=errf, timeout=timeout, preexec_fn=preexec)
         return proc.returncode, False
     except subprocess.TimeoutExpired:
         with open(err_log, "a") as errf:
@@ -117,6 +149,15 @@ def summarize_mismatch(g, first_k=None):
         return "The program produced an empty output (no values were printed)."
     if g.get("result") == "unparseable":
         return "The output could not be parsed as numbers."
+    if g.get("result") == "timeout":
+        return ("The program ran for too long and was killed (likely an infinite or "
+                "pathologically slow loop). Check that every loop counter actually "
+                "advances and terminates.")
+    if g.get("result") == "run_fail":
+        rc = g.get("rc")
+        return (f"The program crashed at runtime (exit code {rc}). Likely an illegal "
+                "instruction, an invalid memory access (reading/writing past an array, "
+                "a wrong base/index register, a clobbered pointer) or a stack problem.")
     if g.get("len_native") != g.get("len_got"):
         return (f"Wrong output length: native={g.get('len_native')}, got={g.get('len_got')} "
                 f"(expected {g.get('total')} values).")

@@ -32,6 +32,9 @@ RETRY_BACKOFF_MAX = 12.0
 # the payload a gateway or model returns.
 ERROR_DETAIL_MAX = 400        # chars kept in LlmError messages / error records
 ERROR_BODY_MAX = 8192         # bytes read off an HTTP error response for usage
+RESOLVE_MAX_TOKENS = 800      # token cap for the --resolve route probe (reasoning models
+                              # return empty content at max_tokens=1 or a too-tight cap;
+                              # 800 was validated on the deepest-reasoning roster member)
 
 
 def _clip_error(text, limit=ERROR_DETAIL_MAX):
@@ -94,6 +97,25 @@ def build_prompt(template_path, kernel_source, call_id=None):
 def strip_fences(content):
     """generate_asm.py's original post-processing: strip leading/trailing markdown fences."""
     return re.sub(r"^```[a-z]*\n|\n```$", "", content.strip())
+
+
+def resolve_model(alias, *, timeout=REQUEST_TIMEOUT, base_url=None, api_key=None):
+    """Return the gateway-resolved underlying model for an alias, as a cheap standalone
+    call (a tiny prompt, capped tokens). This is what call_llm's X-Litellm-Model-Name
+    would resolve to, captured up front so routing is recorded even before the first real
+    exchange (and so a change mid-run — the observed confound — can be detected).
+
+    A 1-token cap was found too small: reasoning models answer empty at max_tokens=1 and
+    the probe resolves to None. Use a modest cap (validated: all exact models answer at
+    300) so the snapshot records the real resolved model.
+
+    Returns the resolved model id, or None if resolution fails."""
+    try:
+        r = call_llm(alias, "ping", max_tokens=RESOLVE_MAX_TOKENS, timeout=timeout,
+                     base_url=base_url, api_key=api_key)
+    except LlmError:
+        return None
+    return (r or {}).get("underlying_model")
 
 
 def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
@@ -332,3 +354,14 @@ def append_call(log_path, fields):
     with open(log_path, "a") as f:
         f.write(line)
         f.flush()
+
+
+if __name__ == "__main__":
+    # `python3 scripts/llm_client.py --resolve aliases...` -> print alias:resolved_model
+    # per line, so a run wrapper can snapshot the route table up front.
+    import sys
+    if len(sys.argv) >= 3 and sys.argv[1] == "--resolve":
+        for a in sys.argv[2:]:
+            print(f"{a}\t{resolve_model(a)}")
+    else:
+        print(__doc__)

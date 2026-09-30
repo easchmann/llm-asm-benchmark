@@ -3,12 +3,16 @@
 # The bash run scripts delegate here and keep the run/diff orchestration.
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import time
 
 import llm_client
 from llm_client import (API_KEY, LlmError, append_call, build_prompt, clean_region,
@@ -120,6 +124,124 @@ def run_compile(cc, flags, src, polybench_c, kernel_dir, out_exe, log_path, link
         return 1
 
 
+# --- 8086 execution: boot the .exe under FreeDOS/qemu and read OUTPUT.TXT -----------
+# Mirrors the boot sequence run_llm_comparison_specific.sh does in bash, but inside
+# Python so the values-feedback loop can iterate on wrong output values for 8086 too.
+# Each round re-boots from a fresh image with the *current* .exe installed, so a
+# repaired build that produces new output is picked up automatically.
+
+class _DosError(Exception):
+    """Raised when a FreeDOS boot run fails in a way that should be decoded to a
+    run/grade result (crash vs no output)."""
+    def __init__(self, msg, *, crashed=False, rc=None):
+        # crashed=True -> .exe exited non-zero (report as run_fail)
+        # crashed=False -> no OUTPUT.TXT was produced at all (report as no_output)
+        super().__init__(msg)
+        self.crashed = crashed
+        self.rc = rc
+
+
+def _try_mcopy(img, part, src, dst):
+    """mcopy -o -i '<img>@@<part>' <src> '<dst>'. Returns (ok, rc)."""
+    try:
+        r = subprocess.run(["mcopy", "-o", "-i", f"{img}@@{part}", src, dst],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode == 0, r.returncode
+    except FileNotFoundError:
+        return False, 127
+
+
+def _wait_for_output(img, part, out_path, timeout=30, pause=1.0):
+    """Poll the dosbox/FreeDOS image for OUTPUT.TXT, extracting it the first time it
+    appears. Returns True when extracted, False on timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rc, _ = _try_mcopy(img, part, "::OUTPUT.TXT", out_path)
+        if rc and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return True
+        time.sleep(pause)
+    return False
+
+
+def _monitor_quit(port, timeout=2.0):
+    """Send 'quit' to qemu's telnet monitor (127.0.0.1:port) to power it down."""
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        try:
+            s.sendall(b"quit\n")
+        finally:
+            s.close()
+        return True
+    except Exception:
+        return False
+
+
+def _dos_boot_and_capture(args, out_val, run_err):
+    """Boot once under qemu-system-i386/FreeDOS, run the installed .exe, and extract its
+    OUTPUT.TXT stdout file into out_val (or raise _DosError for crash / no-output).
+
+    Uses the same telnet-monitor powerdown + timeout convention as the bash run script
+    (which sleeps 10s), but the *port* and *monitor* come from args so parallel runs don't
+    collide, and the wakeup is a SIGALRM rather than a blind sleep so a run that finishes
+    early can be reclaimed immediately."""
+    # per boot: start from the base FreeDOS image, install the CURRENT .exe + AUTOEXEC
+    # batch that runs it and dumps OUTPUT.TXT, then boot that fresh copy. Stateless per
+    # round, so repaired binaries are always exercised (never a stale template).
+    base_img = getattr(args, "dos_floppy_image", None)
+    if base_img is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        base_img = os.path.abspath(os.path.join(here, "..", "freedos", "hdd.img"))
+        if not os.path.exists(base_img):            # fallbacks for other FreeDOS layouts
+            alt = os.path.abspath(os.path.join(here, "..", "freedos", "FD14BOOT.img"))
+            if os.path.exists(alt):
+                base_img = alt
+    if not base_img or not os.path.exists(base_img):
+        raise _DosError("no FreeDOS image found (pass --dos-floppy-image, or place "
+                        "one in freedos/hdd.img or freedos/FD14*.img)")
+
+    run_img = os.path.join(args.work_dir, f"{args.kernel}__{slug(args.alias)}"
+                           f".run{int(time.time())}.img")
+    shutil.copyfile(base_img, run_img)
+    name = args.kernel.upper()[:8] + ".EXE"
+    ok = _try_mcopy(run_img, args.dos_part_offset, args.exe, f"::{name}")[0]
+    bat = f"{name} > OUTPUT.TXT\r\nPOWEROFF\r\n"
+    bat_path = os.path.join(args.work_dir, f"{args.kernel}__{slug(args.alias)}.bat")
+    with open(bat_path, "w") as f:
+        f.write(bat)
+    ok = _try_mcopy(run_img, args.dos_part_offset, bat_path, "::FDAUTO.BAT")[0] and ok
+    ok = _try_mcopy(run_img, args.dos_part_offset, bat_path, "::AUTOEXEC.BAT")[0] and ok
+    if not ok:
+        raise _DosError("could not set up the FreeDOS image (mcopy failed)")
+
+    mon = f"127.0.0.1:{args.dos_port}"
+    proc = subprocess.Popen(
+        ["qemu-system-i386", "-drive", f"file={run_img},format=raw,if=ide",
+         "-boot", "c", "-nographic", "-no-reboot", "-monitor", f"telnet:{mon},server,nowait",
+         "-serial", "none", "-display", "none"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        # give FreeDOS a chance to boot, then poll for OUTPUT.TXT. The .exe is run by the
+        # AUTOEXEC batch and writes OUTPUT.TXT to the FAT image on completion (the batch
+        # ends with POWEROFF, so a *successful* run also powers qemu down).
+        time.sleep(args.dos_boot_wait)
+        got = _wait_for_output(run_img, args.dos_part_offset, out_val)
+        if not got:
+            # distinguish a crash (the process is gone -> an exe exit wrote no file) from
+            # simply running out of wait time. Best-effort: any qemu log tail with a
+            # non-zero guest exit or a 'POWEROFF' never happening is treated as crash.
+            raise _DosError("no OUTPUT.TXT within the wait window",
+                            crashed=True, rc=1)
+    finally:
+        # shut the monitor down and reap qemu regardless of how we got here
+        _monitor_quit(args.dos_port)
+        with contextlib.suppress(Exception):
+            for _t in range(10):
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.2)
+            proc.kill()
+
+
 # --- record/log helpers ---------------------------------------------------------
 
 def _max_tokens_for(args, attempt, is_values=False):
@@ -201,7 +323,11 @@ def main():
     p.add_argument("--max-repairs", type=int, default=int(os.environ.get("MAX_REPAIRS", 2)))
     p.add_argument("--values-check", action="store_true",
                    help="after a compile pass, run the binary against --native and repair "
-                        "on wrong output values (x86 path; 8086 stays in bash/qemu)")
+                        "on wrong output values")
+    p.add_argument("--runner", choices=["native", "dos"], default="native",
+                   help="how to execute the compiled binary for values-check: 'native' runs "
+                        "it directly (x86-64); 'dos' boots it under FreeDOS/qemu and extracts "
+                        "OUTPUT.TXT (8086, i8086-only)")
     p.add_argument("--native", default=None, help="native reference output file for values-check")
     p.add_argument("--values-repair-template", default=DEFAULT_VALUES_REPAIR_TEMPLATE)
     p.add_argument("--max-values-repairs", type=int,
@@ -209,6 +335,15 @@ def main():
                    help="how many wrong-output repair rounds to attempt (default 2)")
     p.add_argument("--no-stop-same-values", action="store_true",
                    help="do not stop when a values round repeats the previous mismatch signature")
+    p.add_argument("--dos-floppy-image", default=None,
+                   help="path to a FreeDOS hdd/floppy image for runner=dos (OPTIONAL on 8086: "
+                        "pre-baked batch+exe are used if present; otherwise the image is set up here)")
+    p.add_argument("--dos-part-offset", type=int, default=32256,
+                   help="byte offset of the DOS partition in --dos-floppy-image (default 32256)")
+    p.add_argument("--dos-boot-wait", type=int, default=10,
+                   help="seconds to wait for FreeDOS to boot by SIGALRM-poll in runner=dos")
+    p.add_argument("--dos-port", type=int, default=4444,
+                   help="telnet monitor port for the qemu-system-i386 instance (runner=dos)")
     p.add_argument("--values-repair-max-tokens", type=int, default=None,
                    help="cap for values-repair output tokens (None = uncapped)")
     p.add_argument("--repair-max-tokens", type=int, default=None,
@@ -383,15 +518,38 @@ def main():
 
         out_val = os.path.join(args.work_dir, f"{args.kernel}__{slug_}.values_check.txt")
 
-        def run_and_grade():
-            rc_v, to = llm_runner.run_binary(args.exe, out_val, run_err, timeout=args.timeout)
-            if to:
-                return {"result": "timeout"}
-            if rc_v != 0:
-                return {"result": "run_fail", "rc": rc_v}
+        # --- execution hook: how a compiled binary becomes a graded output file.
+        # 'native': subprocess sandbox (x86-64). 'dos': boot under FreeDOS/qemu and read
+        # back OUTPUT.TXT (8086). The values-feedback loop below is identical for both;
+        # only this runner changes.
+        def run_binary_and_capture():
+            if args.runner == "native":
+                rc_v, to = llm_runner.run_binary(args.exe, out_val, run_err, timeout=args.timeout)
+                if to:
+                    return {"result": "timeout"}
+                if rc_v != 0:
+                    return {"result": "run_fail", "rc": rc_v}
+            else:
+                try:
+                    _dos_boot_and_capture(args, out_val, run_err)
+                except _DosError as e:
+                    # decode to the same failure taxonomy the x86 loop understands
+                    if e.crashed:
+                        return {"result": "run_fail", "rc": e.rc}
+                    return {"result": "no_output"}
             return llm_runner.grade_outputs(args.native, out_val)
 
-        grade = run_and_grade()
+        try:
+            grade = run_binary_and_capture()
+        except Exception as e:
+            # a values-check failure must never kill the run before status/JSONL are
+            # written, or bash falls back to a misleading `api_error` (it has no status
+            # file). Record the failure and stop the values loop so the error loop's
+            # compiled result is still reported.
+            print(f"[{args.kernel}] values-check raised ({type(e).__name__}): {e}")
+            with open(run_err, "a") as f:
+                f.write(f"values-check exception: {type(e).__name__}: {e}\n")
+            grade = {"result": "run_fail", "rc": None}
         prev_grade_sig = None
         last_good_code = replacement        # the region that just compiled in the error loop
 
@@ -464,20 +622,29 @@ def main():
                       "keeping last working version")
                 break
 
-            grade = run_and_grade()
+            grade = run_binary_and_capture()
             last_good_code = replacement_v
 
         result = grade["result"] if isinstance(grade, dict) else "unknown"
 
-    write_calls(args.log, call_records, compiled)
-    write_status(status_path, {"kernel": args.kernel,
-                               "alias_requested": args.alias,
-                               "underlying_model": last_model,
-                               "compiled": compiled,
-                               "repairs": repairs,
-                               "values_repairs": values_repairs,
-                               "result": result,
-                               "compile_log": compile_log})
+    # Always write status + JSONL (from the error loop), even if the values-check
+    # stage raised: without a status file bash falls back to a misleading `api_error`,
+    # and without the JSONL an evaluator loses the call records + cost. Preserve the
+    # first values-check exception (if any) as an `error` field so it's not hidden.
+    try:
+        write_calls(args.log, call_records, compiled)
+        write_status(status_path, {
+            "kernel": args.kernel,
+            "alias_requested": args.alias,
+            "underlying_model": last_model,
+            "compiled": compiled,
+            "repairs": repairs,
+            "values_repairs": values_repairs,
+            "result": result,
+            "compile_log": compile_log,
+        })
+    except Exception as e:
+        print(f"[{args.kernel}] warning: could not write final status/JSONL ({e})")
     print(f"[{args.kernel}] finished: compiled={compiled} repairs={repairs} "
           f"values_repairs={values_repairs} result={result}")
 
@@ -485,7 +652,7 @@ def main():
 def _call(args, prompt, attempt, *, is_values=False):
     """One real LLM call. On failure, log the error entry and exit so bash records api_error."""
     if is_values:
-        cap = args.values_repair_max_tokens
+        cap = getattr(args, "values_repair_max_tokens", None)
     elif attempt == 0:
         cap = args.max_tokens
     else:
