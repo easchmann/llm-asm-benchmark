@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+# one cell: description -> model -> .S -> build -> run driver, one log record per round
+# usage: python3 scripts/gen_desc.py --kernel atax --level L2 --model Qwen/Qwen3.8-27B --run-dir results/desc_test
+#        --reply-file reply.txt uses a saved reply instead of calling the API
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+
+import llm_client
+from llm_client import LlmError, append_call
+from llm_runner import run_binary
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DESC = os.path.join(ROOT, "kernels", "desc")
+PROMPT = os.path.join(ROOT, "prompts", "desc_x86_64.txt")
+REPAIR = os.path.join(ROOT, "prompts", "desc_repair.txt")
+
+THINK_RE = re.compile(r"<\s*(?:\w+:)?think(?:ing)?\s*>.*?<\s*/\s*(?:\w+:)?think(?:ing)?\s*>", re.S | re.I)
+FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+SIZE_RE = re.compile(r"^size (\S+): (pass|fail)", re.M)
+ERR_RE = re.compile(r"Error:|error:|undefined reference")
+
+
+def cell_id(kernel, level, model, repeat):
+    return f"{kernel}__{level}__{model.replace('/', '_')}__rep{repeat}"
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def fill(template_path, values):
+    text = open(template_path).read()
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", value)
+    return text
+
+
+def load_kernel(kernel, level):
+    kdir = os.path.join(DESC, kernel)
+    spec = json.load(open(os.path.join(kdir, "spec.json")))
+    description = open(os.path.join(kdir, f"{level}.txt")).read().strip()
+    return kdir, spec, description
+
+
+def build_prompt(spec, description):
+    return fill(PROMPT, {"NAME": spec["name"], "SIGNATURE": spec["signature"],
+                         "LAYOUT": spec["layout"], "DESCRIPTION": description})
+
+
+def extract_asm(reply, name):
+    text = THINK_RE.sub("", reply)
+    globl = re.compile(r"\.globa?l\s+" + re.escape(name) + r"\b")
+    blocks = [b for b in FENCE_RE.findall(text) if globl.search(b)]
+    if blocks:
+        return blocks[-1], "fenced" if len(blocks) == 1 else f"last_of_{len(blocks)}_blocks"
+    if globl.search(text):
+        return text, "unfenced"
+    return None, "no_globl"
+
+
+def error_lines(stderr, limit=20):
+    seen = []
+    for line in stderr.splitlines():
+        line = re.sub(r"^\S+\.S:(\d+):", r"line \1:", line)
+        line = re.sub(r"^\S+\.o:\s*", "", line)
+        if ERR_RE.search(line) and line not in seen:
+            seen.append(line)
+    return seen[:limit]
+
+
+def build(asm_path, kdir, exe):
+    obj = exe + ".o"
+    r = subprocess.run(["gcc", "-c", asm_path, "-o", obj], capture_output=True, text=True)
+    if r.returncode:
+        return "assemble_fail", r.stderr
+    r = subprocess.run(["gcc", "-O2", "-I", os.path.join(DESC, "common"),
+                        os.path.join(kdir, "driver.c"), os.path.join(kdir, "ref.c"),
+                        obj, "-o", exe, "-lm"], capture_output=True, text=True)
+    if r.returncode:
+        return "link_fail", r.stderr
+    return None, ""
+
+
+def run(exe):
+    out = exe + ".out"
+    rc, timed_out = run_binary(exe, out, exe + ".err")
+    text = open(out, errors="replace").read() if os.path.exists(out) else ""
+    sizes = dict(SIZE_RE.findall(text))
+    if timed_out:
+        return "timeout", sizes, text
+    if rc < 0:
+        return "crash", sizes, text
+    return ("pass" if rc == 0 and sizes else "wrong"), sizes, text
+
+
+def check(asm_path, kdir, exe):
+    stage, log = build(asm_path, kdir, exe)
+    if stage:
+        return stage, {}, log
+    return run(exe)
+
+
+def feedback(stage, details, mode):
+    if mode == "none":
+        return None
+    if stage == "extract_fail":
+        return details
+    if stage in ("assemble_fail", "link_fail"):
+        return "Your code did not build:\n" + "\n".join(error_lines(details))
+    if mode == "compile+tests" and stage in ("wrong", "crash", "timeout"):
+        return f"Your code built but failed the tests ({stage}). Test output:\n{details[:4000]}"
+    return None
+
+
+def ask(args, prompt):
+    if args.reply_file:
+        return {"content": open(args.reply_file).read(), "underlying_model": "offline",
+                "finish_reason": "offline", "sampling_params": {}, "usage": {},
+                "cost_usd": 0.0, "elapsed_seconds": 0.0, "reasoning": None}
+    prompt += f"\n/* call-id: {llm_client.new_call_id()} */\n"
+    return llm_client.call_llm(args.model, prompt, temperature=args.temperature, seed=args.seed)
+
+
+def save(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--kernel", required=True)
+    p.add_argument("--level", required=True)
+    p.add_argument("--model", required=True)
+    p.add_argument("--run-dir", required=True)
+    p.add_argument("--repeat", type=int, default=0)
+    p.add_argument("--max-repairs", type=int, default=0)
+    p.add_argument("--feedback", choices=["none", "compile", "compile+tests"], default="none")
+    p.add_argument("--temperature", type=float)
+    p.add_argument("--seed", type=int)
+    p.add_argument("--reply-file")
+    args = p.parse_args()
+
+    kdir, spec, description = load_kernel(args.kernel, args.level)
+    cell = cell_id(args.kernel, args.level, args.model, args.repeat)
+    code_dir = os.path.join(args.run_dir, "code")
+    raw_dir = os.path.join(args.run_dir, "raw")
+    os.makedirs(code_dir, exist_ok=True)
+    os.makedirs(raw_dir, exist_ok=True)
+    log = os.path.join(args.run_dir, "calls.jsonl")
+
+    base = build_prompt(spec, description)
+    prompt, prev_sig = base, None
+    for rnd in range(args.max_repairs + 1):
+        tag = f"{cell}.r{rnd}"
+        rec = {"run": os.path.basename(os.path.normpath(args.run_dir)), "cell": cell,
+               "kernel": args.kernel, "level": args.level, "model": args.model,
+               "repeat": args.repeat, "round": rnd, "feedback": args.feedback if rnd else None,
+               "prompt_sha": sha(prompt)}
+        try:
+            r = ask(args, prompt)
+        except LlmError as e:
+            rec.update(stage="no_answer", error=str(e), usage=e.usage, cost_usd=e.cost_usd,
+                       elapsed_seconds=e.elapsed_seconds, stop_reason="api_error")
+            append_call(log, rec)
+            print(f"{tag}: no_answer ({e})")
+            return
+
+        rec.update(underlying_model=r["underlying_model"], finish_reason=r["finish_reason"],
+                   sampling_params=r["sampling_params"], usage=r["usage"],
+                   cost_usd=r["cost_usd"], elapsed_seconds=r["elapsed_seconds"])
+        save(os.path.join(raw_dir, tag + ".txt"), r["content"])
+        if r.get("reasoning"):
+            save(os.path.join(raw_dir, tag + ".reasoning.txt"), r["reasoning"])
+
+        asm, how = extract_asm(r["content"], spec["name"])
+        rec["extract_reason"] = how
+        if asm is None:
+            stage, sizes, details = "extract_fail", {}, f"Your answer contained no .globl {spec['name']}."
+        else:
+            asm_path = os.path.join(code_dir, tag + ".S")
+            save(asm_path, asm.rstrip() + "\n")
+            rec["asm_sha"] = sha(asm)
+            stage, sizes, details = check(asm_path, kdir, os.path.join(code_dir, tag))
+
+        errors = error_lines(details) if stage in ("assemble_fail", "link_fail") else []
+        sig = sha(stage + "\n".join(sorted(errors)) + json.dumps(sizes, sort_keys=True))
+        rec.update(stage=stage, sizes=sizes, first_error=errors[0] if errors else None, error_sig=sig)
+
+        note = feedback(stage, details, args.feedback)
+        if stage == "pass":
+            stop = "pass"
+        elif rnd == args.max_repairs:
+            stop = "budget"
+        elif note is None:
+            stop = "no_feedback"
+        elif sig == prev_sig:
+            stop = "same_errors"
+        else:
+            stop = None
+        rec["stop_reason"] = stop
+        append_call(log, rec)
+        print(f"{tag}: {stage}" + (f" ({stop})" if stop else ""))
+        if stop:
+            return
+
+        prev_sig = sig
+        prompt = base + "\n\n" + fill(REPAIR, {"ASM": asm or r["content"][:8000], "FEEDBACK": note})
+
+
+if __name__ == "__main__":
+    main()
