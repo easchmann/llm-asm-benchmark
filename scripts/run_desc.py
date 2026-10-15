@@ -11,6 +11,7 @@ import sys
 import time
 
 from gen_desc import cell_id
+from llm_client import API_KEY
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GEN = os.path.join(ROOT, "scripts", "gen_desc.py")
@@ -19,7 +20,13 @@ GEN = os.path.join(ROOT, "scripts", "gen_desc.py")
 def finished(log):
     if not os.path.exists(log):
         return set()
-    return {r["cell"] for r in map(json.loads, open(log)) if r.get("stop_reason")}
+    done = set()
+    for r in map(json.loads, open(log)):
+        if r.get("stop_reason") == "api_error":
+            done.discard(r["cell"])
+        elif r.get("stop_reason"):
+            done.add(r["cell"])
+    return done
 
 
 def git(*args):
@@ -48,6 +55,8 @@ def main():
     p.add_argument("--max-repairs", type=int, default=0)
     p.add_argument("--feedback", default="none")
     args = p.parse_args()
+    if not API_KEY:
+        sys.exit("set RIVAULT_API_KEY first")
 
     run_dir = os.path.join(ROOT, "results", args.run_id)
     os.makedirs(run_dir, exist_ok=True)

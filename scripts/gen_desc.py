@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 
 import llm_client
 from llm_client import LlmError, append_call
@@ -144,6 +145,8 @@ def main():
     p.add_argument("--seed", type=int)
     p.add_argument("--reply-file")
     args = p.parse_args()
+    if not args.reply_file and not llm_client.API_KEY:
+        sys.exit("set RIVAULT_API_KEY first")
 
     kdir, spec, description = load_kernel(args.kernel, args.level)
     cell = cell_id(args.kernel, args.level, args.model, args.repeat)
