@@ -1,0 +1,64 @@
+The error is only about `fninit` not being supported on i8086. The FPU instructions like `fldl` (encoded via .byte) work through inline .byte directives, but `fninit` is rejected by ia16-elf-gcc assembler. Likely the FPU is not initialized, but the code probably works anyway — or we can just remove `fninit`. Actually the 8087 typically doesn't need initialization for basic operations, though it's good practice. Since `fninit` isn't supported, we can encode it via .byte directives: fninit = 0x9B 0xDB 0xE3 (wait; fninit is db e3 with fwait prefix 9b). Actually `finit` = 9B DB E3, `fninit` = DB E3. We can emit `.byte 0xdb, 0xe3`.
+
+The instruction says "Fix EVERY error you caused. Do not start over from scratch: reuse the working parts of your previous attempt and change only what is broken."
+
+So just replace fninit with .byte encoding. Let me verify the rest of the logic.
+
+The kernel:
+```
+for (i = 0; i < _PB_N; i++)
+  for (j = 0; j < _PB_N; j++)
+    x1[i] = x1[i] + A[i][j] * y_1[j];
+for (i = 0; i < _PB_N; i++)
+  for (j = 0; j < _PB_N; j++)
+    x2[i] = x2[i] + A[j][i] * y_2[j];
+```
+
+DATA_TYPE is double (8 bytes) by default in PolyBench. N is the problem size at compile time. But the asm uses n variable, which equals N.
+
+Registers mapping:
+- %0 = n (memory)
+- %1 = x1 pointer
+- %2 = x2 pointer
+- %3 = y_1 pointer
+- %4 = y_2 pointer
+- %5 = A pointer
+
+Wait, in the asm strings, %0..%5 are memory operands. With "m" constraint, the operand in small memory model ia16 would be a memory reference like `n` (absolute address) or `x1` — but x1 may be a local array pointer (POLYBENCH_1D_ARRAY_DECL creates a stack array). With "m" constraint the compiler supplies an address operand; in the small model with ia16, memory operands may be accessed via segment-relative addressing. Since memory operands used directly like `movw %0, %dx`, fine.
+
+First loop:
+- dx = n (outer counter)
+- bx = x1 pointer
+- si = A pointer
+- fldl (bx) — load x1[i]; .byte 0xdd,0x07 = fld qword ptr [bx]. Correct: DD /0 with mod=00 reg=000 rm=111 ([bx]) → 0xDD 0x07. Yes.
+- inner: di = y_1 pointer; cx = n.
+- fldl (si): DD /0 [si] rm=100 → modrm 0x04. Correct.
+- fmull (di): DC /1 [di] rm=101 → 0xDC 0x0D. Correct.
+- faddp: DE C1. Correct.
+- si += 8, di += 8, cx--, loop.
+- fstpl (bx): DD /3 [bx] → 0xDD 0x1F. Correct.
+- bx += 8 (x1 pointer advances by i), dx--, loop.
+
+Wait — A indexing: A[i][j], row-major with row size n*8 bytes. Inner loop over j increments si by 8 each time; across outer iterations si continues, covering rows sequentially. Correct.
+
+Second loop: x2[i] += A[j][i] * y_2[j].
+- dx = n * 8 (row stride in bytes). Actually `movw %0, %%dx; shl $1...` three times = n*8.
+- bx = x2 pointer.
+- fldl (bx) load x2[i].
+- compute offset for A[j][i]: si = A + (bx - x2_pointer)? Hmm: `movw %%bx, %%ax; subw %2, %%ax` = (x2_i_ptr - x2_base) = i*8. si = A + i*8 = &A[0][i]. Then inner loop over j: si += n*8 each iteration → &A[j][i]. Correct.
+- di = y_2 pointer; cx = n.
+- inner: fldl (si), fmull (di), faddp, si += dx (row stride), di += 8, loop.
+- fstpl (bx); bx += 8.
+- Loop condition: ax = x2 + n*8; cmp bx; jne. Correct since dx = n*8.
+
+Stack alignment: fld/fstp on 8087 (emulated?) On 8086 without FPU, these instructions trap. Presumably environment runs with emulation or FPU. Fine per earlier approach.
+
+One concern: `shl $1, %%dx` — 8086 supports shl r/m16, imm8? No! On 8086, shift by immediate other than 1 is not supported; only shl r/m16,1 (opcode D1) and shl r/m16,cl (D3). `shl $1` assembles to D1 /4 which is valid on 8086. The previous attempt compiled with only fninit error, so shl $1 is fine.
+
+Also `.byte 0xdc, 0x0d` — DC 0D: mod=00, reg=001 (FMUL), rm=101 ([di]). Correct.
+
+faddp de c1: DE C1 = FADDP ST(1), ST. Correct.
+
+So only fix: replace `"fninit\n\t"` with `".byte 0x9b, 0xdb, 0xe3\n\t"` (finit with wait prefix) or `0xdb, 0xe3` (fninit). I'll use 0x9b, 0xdb, 0xe3 to be safe—actually fninit doesn't wait; finit (with 9b) waits. Either fine. Use fninit bytes: db e3.
+
+Return only the asm block.

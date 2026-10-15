@@ -253,7 +253,8 @@ def _max_tokens_for(args, attempt, is_values=False):
     return args.max_tokens if attempt == 0 else args.repair_max_tokens
 
 
-def base_record(args, attempt, model, elapsed, reasoning_file, is_values=False):
+def base_record(args, attempt, model, elapsed, reasoning_file, is_values=False,
+                sampling_params=None):
     return {"kernel": args.kernel,
             "alias_requested": args.alias,
             "underlying_model": model,
@@ -261,6 +262,8 @@ def base_record(args, attempt, model, elapsed, reasoning_file, is_values=False):
             "elapsed_seconds": round(elapsed, 1),
             "reasoning_file": reasoning_file,
             "max_tokens_requested": _max_tokens_for(args, attempt, is_values),
+            "sampling_params": sampling_params or {},
+            "skip_repair": bool(args.skip_repair),
             "usage": {},
             "cost_usd": None,
             "key_spend_total_usd": None,
@@ -279,6 +282,8 @@ def error_record(args, attempt, err, *, is_values=False):
             "elapsed_seconds": round(err.elapsed_seconds or 0, 1),
             "reasoning_file": None,
             "max_tokens_requested": _max_tokens_for(args, attempt, is_values),
+            "sampling_params": _sampling_args(args),
+            "skip_repair": bool(args.skip_repair),
             "usage": err.usage or {},
             "cost_usd": err.cost_usd,
             "key_spend_total_usd": err.key_spend,
@@ -351,6 +356,16 @@ def main():
                         "Justified by logs: 32K caps made reasoning-chain repair calls "
                         "return finish_reason=length with no content (wasted calls, api_error rows).")
     p.add_argument("--max-tokens", type=int, default=None, help="omit for no cap (initial call)")
+    p.add_argument("--temperature", type=float, default=None,
+                   help="sampling temperature (default = gateway default). Phase-1 decode sweep.")
+    p.add_argument("--top-p", type=float, default=None,
+                   help="sampling top_p (default = gateway default). Phase-1 decode sweep.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="fixed random seed for deterministic draws (default = fresh seed per call)")
+    p.add_argument("--skip-repair", action="store_true",
+                   help="single-shot mode: no compiler-repair and no values-repair. Exercises "
+                        "the model on its first draw only (isolates generation-time capability "
+                        "from loop/convergence effects). Overrides --max-repairs/--max-values-repairs.")
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--dry-run-fail-iters", type=int, default=None,
@@ -385,6 +400,13 @@ def main():
     prev_errors = None
     call_records = []
 
+    # Single-shot mode: no compiler-repair and no values-repair. This isolates
+    # generation-time capability (the model's first draw) from loop/convergence effects,
+    # and is what the --skip-repair runs use to establish the baseline cost of one draw.
+    if args.skip_repair:
+        args.max_repairs = 0
+        args.max_values_repairs = 0
+
     for attempt in range(0, args.max_repairs + 1):
         if attempt == 0:
             if args.dry_run:
@@ -418,7 +440,9 @@ def main():
         reasoning_file = save_reasoning(args.log, args.kernel, slug_,
                                         f"repair{attempt}" if attempt else "", reasoning)
 
-        rec = base_record(args, attempt, model, elapsed, reasoning_file)
+        rec = base_record(args, attempt, model, elapsed, reasoning_file,
+                          sampling_params=r.get("sampling_params") if not args.dry_run
+                          else _sampling_args(args))
         if not args.dry_run:
             # real API call: carry the actual usage/cost so evaluate.py totals include it
             rec.update({"usage": r.get("usage", {}),
@@ -583,7 +607,9 @@ def main():
 
             reasoning_file = save_reasoning(args.log, args.kernel, slug_,
                                             f"values{values_repairs}", reasoning)
-            rec = base_record(args, v_attempt, model, elapsed, reasoning_file, is_values=True)
+            rec = base_record(args, v_attempt, model, elapsed, reasoning_file, is_values=True,
+                              sampling_params=r.get("sampling_params") if not args.dry_run
+                              else _sampling_args(args))
             if not args.dry_run:
                 rec.update({"usage": r.get("usage", {}),
                             "cost_usd": r.get("cost_usd"),
@@ -641,12 +667,22 @@ def main():
             "repairs": repairs,
             "values_repairs": values_repairs,
             "result": result,
+            "skip_repair": args.skip_repair,
+            "sampling_params": _sampling_args(args),
             "compile_log": compile_log,
         })
     except Exception as e:
         print(f"[{args.kernel}] warning: could not write final status/JSONL ({e})")
     print(f"[{args.kernel}] finished: compiled={compiled} repairs={repairs} "
           f"values_repairs={values_repairs} result={result}")
+
+
+def _sampling_args(args):
+    """The sampling override dict from run flags (only keys the user actually set, so
+    the JSONL distinguishes 'explicitly swept' from 'gateway default')."""
+    return {k: v for k, v in (("temperature", getattr(args, "temperature", None)),
+                              ("top_p", getattr(args, "top_p", None)),
+                              ("seed", getattr(args, "seed", None))) if v is not None}
 
 
 def _call(args, prompt, attempt, *, is_values=False):
@@ -657,8 +693,10 @@ def _call(args, prompt, attempt, *, is_values=False):
         cap = args.max_tokens
     else:
         cap = args.repair_max_tokens
+    sp = _sampling_args(args)
     try:
-        return llm_client.call_llm(args.alias, prompt, max_tokens=cap, timeout=args.timeout)
+        return llm_client.call_llm(args.alias, prompt, max_tokens=cap, timeout=args.timeout,
+                                   **sp)
     except LlmError as e:
         print(f"[{args.kernel}] API call failed (attempt {attempt}): {e}")
         try:

@@ -1,0 +1,585 @@
+The errors: 'Ap', 'Xp' undeclared — the POLYBENCH_2D_ARRAY_DECL macro defines arrays differently. In PolyBench, with the array declaration macro, the parameter becomes `A` declared as `DATA_TYPE (* A)[N]` or something like `DATA_TYPE A[M][N]`... Actually POLYBENCH_2D_ARRAY_DECL(A, DATA_TYPE, M, N, m, n) declares `DATA_TYPE (*A)[m][n]`? Let's recall polybench declarations:
+
+```c
+#define POLYBENCH_2D_ARRAY_DECL(var, type, dim1, dim2, hdim1, hdim2) \
+  type (*var)[hdim2]; \
+  var = (type(*)[hdim2])POLYBENCH_ALLOC_CONTAINER(...)
+```
+
+Actually in polybench:
+```
+#define POLYBENCH_2D_ARRAY_DECL(var, type, dim1, dim2, hdim1, hdim2) \
+  POLYBENCH_2D(var, type, dim1, dim2, hdim1, hdim2);
+```
+Hmm, no. Let me recall the actual polybench.h:
+
+```c
+#ifdef POLYBENCH_USE_SCALAR_LN ...
+#define POLYBENCH_2D_ARRAY_DECL(var, type, dim1, dim2, hdim1, hdim2) \
+  type (* var)[hdim2] = (type(*)[hdim2])XALLOC(...);
+```
+
+Actually the real polybench.h has:
+
+```c
+# define POLYBENCH_2D_ARRAY_DECL(var, type, dim1, dim2, hdim1, hdim2) \
+  type (* var)[hdim2]; \
+  var = (type(*)[hdim2])polybench_alloc_data(...)
+```
+
+So the variable in kernel_atax is just `A` (the parameter), of type `DATA_TYPE (*)[N]` after POLYBENCH_2D macro expands. POLYBENCH_2D(A,M,N,m,n) expands to `A[m][n]` when not using array decl... Actually within the function, the parameter is `DATA_TYPE POLYBENCH_2D(A,M,N,m,n)` = `DATA_TYPE A[M][N]` withh... it's `A[m][n]` (run-time dims). Actually it's a static macro: `#define POLYBENCH_2D(var, dim1, dim2, hdim1, hdim2) var[hdim1][hdim2]` — wait it's `var[dim1][dim2]`? The macro is `#define POLYBENCH_2D(var, dim1, dim2, hdim1, hdim2) var[hdim1][hdim2]`. Hmm, actually in polybench: `# define POLYBENCH_2D(var, dim1, dim2, hdim1, hdim2) var[dim1][dim2]` — dimension names come from the header (M, N). So parameter is `DATA_TYPE A[M][N]` where M,N are compile-time constants from atax.h.
+
+Wait the errors say "Ap undecleared" at line 152 — that's MY previous asm referencing pA? The user's PREVIOUS_ASM used pA, px, etc., which are undeclared. And also "Ap" errors in attempt0 — presumably I need to just reference the actual parameter names: m, n, A, x, y, tmp.
+
+But "memory input not directly addressable" for inputs 2..5 — passing `A` (an array parameter, which is a pointer type actually... A is `DATA_TYPE (*)[N]` decayed) — hmm. The "not directly addressable" error means the operand can't be expressed in an addressing mode. The previous attempt used "m" constraints for pointers; on a 16-bit target, gcc may want to materialize them. Better approach: use register constraints — put pointers into registers via "r" constraints.
+
+Simplest fix: use "r" constraint or compute inside asm from memory operands. Use inputs: m and n as "m" or "r"? m and n are ints, addressable (stack slots). The pointers A, x, y, tmp: use "r" constraints? But clobbering... we can use input-output? We just read them once at start. Using "r" for pointer inputs: gcc loads them into registers (e.g., bx, si, di, bp?). But we need bp for addressing. Better: use input constraints "di", "si", "bx", and ... we need 4 pointers + bp. Registers available for near pointers: bx, si, di, bp. Plus we use ax, cx, dx for computation. 4 pointers: A, x, y, tmp → bx, si, di, bp? But we need bp for our own addressing? Actually with pointers in registers, we don't need bp-based addressing at all! We can use the registers directly as base pointers.
+
+But careful: inputs get loaded at asm start; we clobber them, but as inputs that's fine if we also declare them in clobber list? No — an input register that we modify: GCC forbids modifying an input. But we can declare them and not modify... We need A advancing row by row. Solution: copy A base pointer from input register into another register first (but that clobbers the input). The rule: you cannot use an input in a clobber list, and modifying it is UB unless it's also an output. Common trick: list inputs, and immediately copy them to other registers. As long as the asm starts by copying inputs to other regs before modifying them, that's accepted practice? Actually GCC assumes inputs are not modified; modifying an input that's also just an input means GCC may reload it elsewhere... Within a single asm, modifying an input is explicitly allowed if you don't need it unmodified? The docs say: "you may not modify an input" unless declared as output too. But practically, since after this asm ends, values recomputed. GCC might reuse otherness? Safer: use dummy outputs tied: `: "=b"(dummy)...` complicated.
+
+Alternative approach that avoids all this: load pointers from memory inside the asm. Use "m" inputs for m and n (fine), and for the arrays use trick: since A etc. are pointer variables (parameters are arrays decaying — but in this case, with POLYBENCH_2D, A has type `DATA_TYPE (*)[N]`? Actually parameter declared as `DATA_TYPE A[M][N]` with M,N compile-time constants → decays to pointer-to-array. The "memory input not directly addressable" arises because A as a parameter is a variable holding pointer on the stack — should be addressable... hmm, why not directly addressable? Maybe because gcc passes it in a register (small model, parameters passed in registers on ia16-elf-gcc with regparm?). ia16-elf-gcc default calling convention: some arguments in registers. So A, x, y, tmp may live in registers, making "m" not addressable → error "memory input is not directly addressable".
+
+So the fix: use register inputs. Constraint short-circuit: use `"r"` constraints for the four pointers, m and n as "m" or "r"? m and n are also parameters, possibly in registers; "m" for ints should be fine because gcc can spill to stack. But maybe cleaner: everything "r" and then copy.
+
+Plan: inputs:
+- m: "m"(m) — fine (spillable).
+- n: "m"(n)
+- A: "r"(A) → ends in some register among... gcc picks. We need bx, si, di for addressing; gcc might pick cx or dx. Hmm.
+
+Better: use specific register constraints for the four pointers: `"b"(A), "S"(x), "D"(y)`? ia16 supports "S"=si, "D"=di, "b"=bx, "a"=ax, "d"=dx. But bp has no standard constraint? There may be "p"? For ia16, constraints include "S"(si), "D"(di), "b"(bx), "a"(ax), "c"(cx), "d"(dx). bp likely has a special constraint or none directly. We have 4 pointers: A,x,y,tmp. Registers bx, si, di usable as base/index; dx can't be used for memory addressing. So allocate A→bx, x→si, y→di, tmp→? We need tmp pointer twice with i offset; we could keep tmp value on stack instead, and compute tmp pointer with di or via bp. Actually we can avoid needing a 4th pointer register: keep tmp value in a stack slot via bp... but bp without a constraint is a problem.
+
+Alternative: store tmp value in a memory operand via "m" reference created by output? Simpler: get tmp pointer into a register, e.g., dx, and then when needed move to di/si temporarily. Or use bp: constraint for bp in ia16-elf-gcc... Not sure it exists. Let's avoid bp entirely, like the previous attempt avoided... previous used bp via volatile push/mov — that was fine assembly-wise; the only errors were naming and addressability.
+
+So: fix errors by:
+1. Referencing actual variables m, n, A, x, y, tmp.
+2. Making pointer inputs addressable: use "r" register constraints.
+
+Design: inputs: `"rms"(m)`... Let's use:
+- n: "m"(n)
+- m: "m"(m)
+- A: "r"(A) — but we need it in bx to use (%bx,%di). Let's use explicit constraints: "b"(A), "S"(x), "D"(y), and tmp pointer...? We could avoid needing tmp pointer in a register: tmp[i] is written once per outer iteration at end; we can compute its address using di: after inner loops, di is free. tmp pointer needs to be somewhere — hold it in cx during outer loop (cx is used as loop counter in inner loops, so between inner loops cx is free). So: at the top of each outer iteration, load tmp pointer = base + 2*i into cx? But base tmp pointer must persist across iterations. Hmm, registers that persist across outer loop: we need y base, tmp base, x base... x only needed per outer iteration (inner loop 1), y needed inner loop 2, tmp needed store at end.
+
+Alternative: keep all four pointers in registers: A=bx, x=si, y=di... then no register left for tmp persistently and no spare for si/di changes inside loops.
+
+Wait within inner loops we advance row pointer: A row base advances by row each outer iteration (keep in bx, advance bx by 2*n each stage — good, previous did that). x pointer: we can advance x pointer: x[j] with j advancing; per outer iteration x restarts at x base. If x in si, we'd clobber si. We need x base each iteration. Options: reload x pointer from its GCC-generated register? Inputs are in registers chosen by gcc; we can't clobber them without an output tie.
+
+Cleaner approach: don't use pointer inputs at all. Compute addresses ourselves from... we don't have access to array addresses except through the variables. Hmm, but A is a parameter, possibly in a register; we can pass it in a register we control.
+
+Alternative clean approach: push/register. Take control of ALL registers with volatile asm, using push/pop to save, get pointers from inputs passed in whatever registers gcc chose — that's messy since we don't know which registers.
+
+Better: force specific register constraints and treat them as inputs we immediately copy to volatile registers. Use:
+- "m"(n), "m"(m)
+- "r"(A), "r"(x), "r"(y), "r"(tmp) — generic r, gcc assigns among ax,cx,dx,bx,si,di. We don't know which. To copy them into known registers, we can mov from the input operands by name: `%1` etc.侵犯. In extended asm, operands are referenced as %0..%n and gcc substitutes the right register name! E.g., "movw %3, %%bx" where input 3 is a register operand — this works, gcc emits like "movw %%cx, %%bx". Yes! That's the standard trick: reference input operands by placeholder to move them into known clobbered registers.
+
+So plan:
+```
+__asm__ __volatile__ (
+  "pushw %%bp\n\t"
+  "movw %%sp, %%bp\n\t"
+  "subw $8, %%sp\n\t"
+  /* frame: -2 i, -4 tmpval, -6 n2, tmp base ptr 2(bp), y base 4(bp), x base 6(bp), n 8(bp), m 10(bp) */
+  ...
+  "movw %4, %%bx\n\t"  /* A */
+  "movw %5, :???"
+```
+Store the four pointers into our bp frame, then restore sp from bp at end. That way gcc's chosen input registers are consumed immediately at the top, before we clobber anything. Since we copy them into memory first thing, the input values are used before modification — safe.
+
+Stack frame layout (after push bp; mov sp,bp; sub $10,sp):
+- 2(%bp): A pointer
+- 4(%bp): x pointer
+- 6(%bp): y pointer
+- 8(%bp): tmp pointer
+- 10(%bp): m
+- 12(%bp): n
+- -2(%bp): i
+- -4(%bp): tmp value
+- -6(%bp): 2*n (row stride)
+
+Inputs order: A(0), x(1), y(2), tmp(3), m(4), n(5)? Let's do: `"i"...`. Use numeric operands: since asm has no % operands otherwise (we use %%reg), fine.
+
+Actually simpler: pass pointers as "m" won't work (not addressable). Pass as "r". m and n as "m"? m,n ints — "m" addressable (stack). Fine. But could also be "r". Keep "m".
+
+Code with placeholders:
+At top: pull pointers into stack. But wait: placeholders like %0 inside asm are replaced by gcc with the operand's register/memory. For a "r" operand gcc emits "%%cx" e.g. — actually for register operand it emits like "%cx"? In GAS AT&T, "movw %0, %%bx" with register operand → "movw %%cx, %%bx". Good.
+
+But wait — the sub $10,sp must happen AFTER we... no, we push bp first then move sp→bp and decrement, then store pointers into stack slots using (%bp). Fine.
+
+Hmm but does ia16-elf-gcc's extended asm support "r" for pointers — should, pointers are 16-bit.
+
+Clobber list: "ax","bx","cx","dx","si","di","cc","memory". We use bx,si,di as our registers after copying inputs out — clobbering inputs is fine since we copied them to memory first and inputs come from "r" (gcc could have used bx as one of the input regs; we'd clobber it after copying — allowed? Modifying an input register is a problem only if gcc expects it preserved; it doesn't. The concern is only if you modify before using. We use immediately.)
+
+Wait — but if gcc assigns input A to bx and we also clobber bx... clobber list says these regs are clobbered; input constraint "b"? If gcc assigns input to a clobbered register, that's an error ("asm operand ... conflicts with clobber list"?) Actually gcc errors if a clobbered register is also used as input explicitly with a matching constraint. Generic "r" inputs go through reload; gcc won't use clobbered registers... Actually gcc does not allocate inputs into explicitly clobbered registers — it errors or avoids. With "r", reload won't pick clobbered regs. So A,x,y,tmp will be in ax,cx,dx mostly (si,di not clobbered are also possible? si and di ARE in my clobber list — then gcc won't put inputs there; only ax,cx,dx available — exactly 3 hardware regs for 4 pointer inputs!) Problem: gcc may need more registers. Remove si,di,bx from clobber list? But we do clobber them. If they're in clobber list, inputs can't be there, leaving ax,cx,dx (movable to others). 4 inputs needing registers with only ax,cx,dx free... reload would need to spill one input to stack, which it can do? Reload handles register pressure by spilling — the input values are parameters possibly already in registers; gcc can copy one into a stack temp and feed operand as "m". Yes, reload can materialize the operand as memory. So it works, maybe inefficiently. But does gcc accept "r" operand + clobber conflict? With generic "r", if no reg available, it goes to stack — fine.
+
+Hmm, but actually with ia16 there may also be a "p" constraint for bp in ia16-elf-gcc? I recall ia16 gcc has constraints: 'a','b','c','d','S','D' and maybe "pp" or something for base pointers. Not sure; avoid.
+
+Alternatively, avoid register inputs entirely: pass mem addresses of pointers? Parameters in registers aren't in memory... gcc would spill them to stack if given "m"? For parameters passed in registers, "m" requires gcc to spill to a stack slot, which it can do — but the error earlier said "memory input 2 is not directly addressable" which suggests gcc refused. That error occurs when the operand can't be represented in memory — for a pointer-valued expression maybe gcc tries operand of type pointer-to-array and can't form memory reference? Actually "not directly addressable" typically when operand is a register variable or expression. Parameters used via array decay: A has type `DATA_TYPE (*)[N]`? Hmm the POLYBENCH_2D makes it `A[M][N]`, decaying. The operand is the array itself (glvalue), and gcc can't put an array in memory operand by name? It's addressable really... but the earlier error indicates it failed. Stick with "r".
+
+Hmm wait, another subtlety: the memory-clobber outputs — we write y and tmp arrays, memory clobber handles it.
+
+Now the algorithm, registers:
+- bp frame as above.
+- Init: n2 = 2*n stored at -6(bp).
+- Loop 1: y zeroed: si = y base (from 6(bp)), cx = n, ax=0, store (si), add 2. But wait, then we overwrite si with x pointer; keep y base stored, fine.
+- Outer loop: bx = A base; i = 0.
+- Each iteration:
+  - tmpval (-4bp) = 0.
+  - Inner loop 1: si = x base; di = 0; cx = n; loop: ax=(bx,di); imulw (%si) → dx:ax; add ax to -4bp. add 2 si, add 2 di, loop.
+  - Inner loop 2: si = y base; di = 0; cx = n; loop: ax=(bx,di); imulw -4bp; dx=(si); add; store; add 2 si, 2 di.
+  - Store tmp[i]: ax=i*2: mov -2bp→ax; add ax,ax; si = 8bp (tmp base); add ax,si; dx = -4bp; (si)=dx.
+  - Advance bx by -6bp (2n).
+  - i++ ; cmp with m at 10(bp); jl.
+
+Note imul result: dx:ax; low in ax — fine (overflow undefined, matches float semantics? DATA_TYPE here: atax typically double, but for this target maybe float or int? The header atax.h defines DATA_TYPE; for ia16 they probably use... In polybench atax DATA_TYPE is double by default, but SCALAR_VAL(0.0) and the C semantics would use FP emulation. But we only produce assembly; correctness relative to types is judged presumably with DATA_TYPE = int? Given previous attempt used integer ops and the task expects us to handle it, and the errors were purely about naming/addressability, not semantics. I'll keep integer ops. Hmm, risk: if DATA_TYPE is double, imul is wrong. But earlier attempt assumed double? It used 16-bit int ops. The compiler errors didn't complain about types. Since we can't know, and the benchmark harness likely sets DATA_TYPE=int for iar 16-bit (gcc can't do doubles easily... it can, soft-float). Common practice in these asm-translation benchmarks: they set DATA_TYPE to int when target lacks FP. Previous attempt went with int and only naming errors were reported — meaning it compiled conceptually. Keep integer.
+
+imul with memory operand: "imulw (%si)" — on 8086, imul r/m16 → dx:ax. But wait, we need ax = A value before; "movw (%bx,%di), %%ax" then "imulw (%si)" gives dx:ax = ax*x[j]. Good. "addw %%ax, -4(%bp)" adds ax to memory — legal (mem as destination, reg source).
+
+But hold on: "addw %%ax, -4(%bp)" — 8086 supports mem as dest with reg source: yes add [mem], reg is legal.
+
+"imulw -4(%bp)" — imul r/m: legal, multiplies ax by mem.
+
+Careful: (%bx,%di) — max index... bx = A base + row offset which grows to m*2n; addressing wraps 16-bit, fine small model.
+
+One issue: using si for both x pointer and later y pointer — fine since sequential.
+
+Also note DF flag: GCC requires direction flag cleared on entry; we don't use string instrs. Fine.
+
+Also must preserve bp — we push/pop it. We use volatile; no other operands after. Restore order: "movw %%bp, %%sp\n\t popw %%bp".
+
+Now operand list: needing to load from bp-frame — but wait, we can also directly use the input registers via placeholders if we wanted; using bp frame is simpler for registers we reuse across loops.
+
+Order of inputs & placeholders:
+%0 = A (r), %1 = x (r), %2 = y (r), %3 = tmp (r), %4 = m (m), %5 = n (m)? But m and n are parameters possibly in registers too — "m" will make gcc spill both to stack, that's fine and addressable, but with stack-frame-based asm... we store their values into our frame anyway: "movw %5, 12(%bp)". Wait — can an "m" operand be used as source in movw? "movw %5, 12(%bp)" emits like "movw -6(%bp), 12(%bp)"? NO! Memory-to-memory illegal! The "m" operand might be a memory operand; "movw %5, 12(%bp)" would be mov mem,mem = illegal. Must route through register: "movw %5, %%ax; movw %%ax, 12(%bp)".
+
+But which register to use for those transfers — ax etc. all clobbered, fine at top.
+
+Actually simpler: pass m and n as "r" too. %4=m reg, %5=n reg. Then "movw %4, 10(%bp)". And "movw %5, 12(%bp)". Actually then gcc must find 6 input registers with 8 clobbered (ax,bx,cx,dx,si,di) — none free! Reload must keep all inputs... inputs must be in registers at asm start; clobbers remove all general regs except bp and sp. That's impossible: gcc will fail "could not find a register" or spill inputs? Inputs can't be spilled — they must be in the operand's register at asm time. If all regs are clobbered, gcc errors. Indeed GCC: clobbered registers can't hold inputs; reload will... I believe gcc reports an error like "could not find registers to allocate" or spills the pseudo... Reload CAN spill: inputs get computed into new pseudos that need registers — infinite regress. Gcc would emit "error: unable to find a register to spill" or handle by using bp-relative memory? Inputs as memory operands cannot be assigned to "r" constraints. So order matters: assign constraints without clobber conflict.
+
+Solution: explicit register constraints matching gcc's registers: use "a"( lets use ax) hmm but we want minimal conflicts. Use explicit constraints: A→"c"(cx), x→"d"(dx), y→"S"(si)?? but si clobbered... explicit constraint + clobber same register → error? Specifying an input in a register it's also declared clobbered: GCC gives an error "asm-specifier for variable conflicts with asm clobber list". Hmm does it? I believe yes for early versions; modern gcc errors "asm operand has impossible constraints" or similar. To be safe, use explicit register constraints WITHOUT clobbering those regs in the list, and instead save/restore or don't clobber them (or treat modifying inputs as allowed after last use... unsafe as gcc may not save them).
+
+Cleanest: push all clobbered... Let's think: we need at asm start to transfer 4 pointer values + m, n into memory/registers. gcc can put "r" operands into any allocatable reg. If clobber list = ax,bx,cx,dx,si,di, then no allocatable regs remain → impossible conflict. So choose: clobber list excludes, say, cx; but we need cx... we reload cx as loop counter each loop — we clobber cx. Conflict.
+
+Alternative: do the transfers using push/pop of gcc's chosen registers? We don't know registers → can't push by name... but we can push operand placeholder! "pushw %0" where %0 is register operand → pushes that register. Then "pushw %%bp; movw %%sp, %%bp"... wait order: we want the input register values pushed BEFORE taking sp as bp, but push bp also needed; pushed order defines frame offsets. Trick: push each input onto stack first (they're register operands → push reg is legal):
+
+```
+"pushw %0\n\t"   /* A */
+"pushw %1\n\t"   /* x */
+"pushw %2\n\t"   /* y */
+"pushw %3\n\t"   /* tmp */
+"pushw %4\n\t"   /* m (if r) */
+"pushw %5\n\t"   /* n */
+"pushw %%bp\n\t"
+"movw %%sp, %%bp\n\t"
+"subw $18, %%sp\n\t"
+```
+Frame (bp-relative): 2(%bp)=tmp, 4(%bp)=y? order: bp+0 = saved bp; bp+2 = last pushed = n; bp+4 = m; bp+6 = tmp; bp+8 = y; bp+10 = x; bp+12 = A. Then locals at negative: -2 i, -4 tmpval, -6 n2, -8 spare.
+
+Then we no longer need gcc to preserve any register after: we can restore "movw %%bp, %%sp; popw %%bp". Clobber all six regs. And inputs are "r" (gcc picks any of the six before... wait inputs must be live AT asm entry in their registers, and clobbered regs can't be inputs!). Ugh — same problem: with generic "r" and all six clobbered, reload has no reg for inputs.
+
+Hmm. But is that actually a hard error? GCC does support clobbering all; reload uses memory for inputs? No — inputs with "r" constraint need registers. GCC will then spill OTHER pseudos to make room; if all pseudos including the input pseudos themselves... reload can split the input: copy the parameter (already in stack or reg) into a new pseudo, allocate register — but no registers available. It could keep it on stack and use "m"? Constraint says "r". Dead end → "error: unable to find a register to spill" or i386 backend "could not allocate". Actually let me recall: it's well known that you cannot clobber registers needed for "r" inputs. So we must use explicit constraints that are NOT in clobber list, and we must not truly clobber those specific registers in a way gcc cares... but gcc will assume input regs are unchanged after asm? Actually gcc assumes asm preserves inputs? No — gcc assumes that after the asm, an input's register may have been modified, and if the value is needed later, reload inserts a reload of it (since it's a pseudo possibly living across). Hmm, the documented rule: "you may not modify an input unless it will be... " To be safe and correct, the standard trick: dummy outputs: declare each pointer as both input and dummy output? That forces register that we may modify: `: "=b"(A_dummy)...`. With dummy outputs we can freely use.
+
+Alternatively use earlyclobber? Simpler accepted pattern: declare pointers as OUTPUT via temporary variables:
+
+```
+void *a_=A; /* then asm with "0"(a_) matching "=b" out */ 
+```
+Hmm messy. Standard approach: dummy output "; register killed":
+
+```
+: "=b"(dA), "=S"(dx_), "=D"(dy), "=c"(dtmp)? 
+: "0"(A), "1"(x), ...
+```
+Matching-constraints dummy outputs. That costs copies but is clean. But clobber issue: "=b" output means final value unconsumed; gcc will consider A as clobbered... using matching constraint: input "0" tells gcc value loaded into same reg; then output "=b" marks reg dead after. This is the classic workaround. But note "S" and "D" constraints — do they exist in ia16-elf-gcc? I believe ia16 backend defines a, b, c, d, S, D? Let me think: ia16's config has constraints 'a' (ax), 'b'(bx), 'c'(cx), 'd'(dx), 'S'(si), 'D'(di)? I'm fairly confident ia16-elf-gcc defines 'S' for si and 'D' for di and maybe 'T'? Hmm. Actually I recall for ia16: "a, b, c, d" plus "S" (si), "D" (di), "p"? Let me hedge: I can't verify; risky.
+
+Alternative avoid guessing: use generic "r" for the pointer inputs and INT 4 outputs? Can't tie generically without knowing assignment.
+
+Another approach entirely: avoid needing pointer inputs in specific registers by copying them at asm start using operand placeholders. The key fix to the "all regs clobbered" conflict: clobber fewer registers — conflict only arises if gcc cannot find registers for the inputs. If inputs are "r" and clobbers include, say, ax,cx,dx only (not bx,si,di), gcc can assign the 4 pointer inputs to bx,si,di, and... only 3 regs left — 4th input? m,n as "m" are memory (no reg needed). So inputs: A,x,y,tmp as "r" (4 regs) but after clobbering ax,cx,dx only bx,si,di remain = 3. Not enough. Add "p"? If bp constraint exists... unknown.
+
+Hmm. What about m,n as immediates "g"? "g" allows general mem/immediate/reg. For ints they'd be memory or constant; M and N from atax.h are compile-time constants of size maybe 64/128. m and n are variables = M, N constants. If we use "n" immediate constraint: "i"(n) works only if constant — n = N is constant extern? n is local initialized to N — constant-propagation can fold to constant in asm operand? GCC does constant folding for asm inputs only if expression is a constant; `n` is a variable, not folded (known-value-based asm constant folding does happen through cselib? There is "known constant" handling: gcc can pass constant operands from variables? Not reliably.) Use "m" for m,n → they get spilled to stack; then movw from that stack slot into our frame via register. Fine — memory operand as source into reg, then store.
+
+So inputs: A,x,y,tmp each "r" → need 4 registers among NON-clobbered. Let's decide clobber = {"ax","cx","dx","memory","cc"} only?? But we use bx,si,di heavily and they're holding the pointers. If bx,si,di are not in clobber list, gcc believes they're preserved — but they were inputs and per the rule we may not modify inputs. However: after we've copied pointers into our stack frame at the top, we can then push/save the input registers themselves too (permanently), so gcc's belief of preservation... gcc would restore/reload the pseudo from stack if needed after asm, since the pseudo's home is memory — when a pseudo lives across the asm, reload updates its home. Actually the concern: input register u; the pseudo's live range continues after asm; gcc assumes asm preserves? The rule states modifying an input without declaring it output is undefined/unsupported; gcc may not reload the value. But if we "pushw %0" at very start, the original value is preserved on stack but not restored to the register — register is clobbered without knowledge.
+
+The officially sanctioned way: early-clobber outputs with matching inputs, OR simply list regs in clobber and inputs in memory ("m"). "m" failed earlier with "not directly addressable" for arrays... but wait — that failure was for "m" on the pointer variables themselves. Why not directly addressable? For a function parameter of pointer-to-array type used as `A`, the operand expression type may be the ARRAY type `DATA_TYPE (*)[N]`? Passing `A` gives pointer value... The operand is the glvalue `A` (a pointer object of type DATA_TYPE (*)[N]... it's fine memory-wise. Hmm "memory input ... not directly addressable" typically happens when the object is in a register (parameter in reg) — gcc CAN spill a register pseudo to memory for 'm' constraint... it should. But the error occurred, apparently for unknown pointers 'Ap','Xp'... In first attempt the names were garbage; the "not directly addressable" applied to memory inputs 2..5 — i.e., operands listed as "m"(X) where X were invalid declarations? Those errors happen together; maybe the operand expression being an array-of-unknown-bounds type. Since A decays... whatever.
+
+Practical accepted pattern many people use for this kind of benchmark: pass everything as "r" inputs with clobbers excluding only a few regs, then before touching anything, `pushw %0` etc. But conflict...
+
+Let me reconsider: maybe count registers: clobber list ax,bx,cx,dx,si,di = 6. Inputs "r" → 0 available → gcc error "could not find a register to spill" or actually reload may assign input pseudos to... GCC's ia16 has registers ax,bx,cx,dx,si,di bp sp. bp is fixed (frame pointer), sp fixed. So truly none.
+
+So: clobber only {ax, cx, dx, cc, memory}; pass A,x,y,tmp as explicit "b","S","D", and 4th where? "r" for tmp — remaining allocatable non-clobbered non-constrained regs: none besides the ones used. If A="b", x="S", y="D", tmp="a"? But we need ax for computation — a is fine to clobber? Not in clobber list; but tmp pointer input is dead after we copy it... With "a" as input constant and we clobber ax — not officially allowed.
+
+OK the robust sanctioned pattern: matching dummy outputs. Define:
+
+```
+int *a_saved, x_saved... 
+```
+We can't declare variables (we only replace scop region, but we CAN declare temporaries inside the asm block region? The region is statements; we can add C code lines like `int *tmpA = A;`? The replacement region replaces the loop code; we may write plain C statements. Yes! We're allowed to write C code between pragmas, as it's the function body region. We can declare local temporaries.
+
+So:
+
+```
+{
+  __asm__ ... with outputs for pointers...
+}
+```
+
+E.g.:
+
+```
+{
+  int i, j;
+  /* not needed */
+}
+```
+
+Simplest robust: use "b", "S", "D" for three pointers with matching dummy outputs; for tmp pointer + m + n use memory? Getting the tmp pointer without a register constraint: we could pass `tmp` as... hmm.
+
+Alternative: skip tmp pointer from asm input; compute y[j] update and tmp store needs tmp address. Actually think again: we could restructure to avoid storing tmp into memory: computing tmp[i] then immediately reusing A[i][j] requires a second pass over A, so tmp value must persist — hold in a stack slot (-4(%bp)) that we already do. The only need for tmp pointer is the final store. We can get tmp pointer by other means: pass `&tmp[0]`? That's a pointer expression `tmp` too. Hmm.
+
+Use "b"(A) and "S"(x) and "D"(y)... and tmp? We have registers under explicit constraints: also could use... after copying all three into frame, bx,si,di become free (they're only "inputs", clobbered implicitly by output dummies). Yes with matching outputs we may trash them. So we need tmp somewhere at start — pass tmp pointer as 4th matching in "a"? "a"(tmp) with dummy "=a" output — ax is used later but that's fine since dummy output. Do ia16 constraint letters include "a","b","S","D"? I need confidence. ia16-elf-gcc constraint table: I recall from the ia16 backend (maintained by Rask Ingemann Lambertsen / Andrew Jenner / tkchia). The ia16.md uses constraints like "a", "b", "c", "d", "S"?? Hmm. In tkchia's gcc-ia16, constraints defined in config/ia16/ia16.h:
+
+```
+#define CONSTRAINTS 'r' general, 'a'... 
+```
+
+I genuinely memory: gcc-ia16 register_constraints: 'a' -> ax, 'b' -> bx, 'c' -> cx, 'd' -> dx, 'S' -> si, 'D' -> di, plus 'pp' for bp-based? There's "ppa"? I think there's constraint "ppa" for bp+displacement addressing? Not sure. I'll assume a,b,c,d,S,D exist (this matches common ia16 asm examples I've seen: e.g. "movw %%bx, port..." and inline asm examples from tkchia docs use %%si etc.). I've seen example code from tkchia's "writing GCC extended asm for ia16" blog using "S" and "D"? I believe the backend defines: a=ax, b=bx, c=cx, d=dx, S=si, D=di, and also 'T' (?), and maybe 'bp' via "x"? To reduce risk, prefer generic "r" combined with dummy outputs tied via matching numbers ("0") — generic across the board:
+
+Outputs: "=r"(dummyA), "=r"(dummyX), ... inputs "0"(A), "1"(x), ... That forces the pointer into an output-assigned register; input refers to same reg. Then we're free to clobber everything? No! The assigned output registers are register classes; we must not clobber them in the clobber list (gcc errors: "conflicts with clobber"), but we CAN trash them as dummy outputs. The other four general regs can be clobbered: but we need bx,si,di,ax,cx,dx = 6 for computation, plus bp. gcc might assign the "r" outputs to any of ax,bx,cx,dx,si,di — up to 4 outputs; they might land in ax,cx,dx... then we lack compute regs. But we can immediately copy pointer values from the output registers... hmm we don't know which regs. We can mov by placeholder: after asm starts: "movw %0, 12(%bp)"? No wait — order: we need bp set up first, but bp itself is a register used for addressing... bp is not allocatable (frame pointer), so inputs never go in bp. Plan:
+
+```
+asm volatile(
+  "pushw %%bp\n\t"
+  "movw %%sp, %%bp\n\t"
+  "subw $14, %%sp\n\t"
+  /* copy the four pointers (register operands %0..%3) into frame */
+  "movw %0, %%ax\n\t" ... but if %0 is register we need memory-slot transfers
+```
+"movw %0, 2(%bp)" — if %0 is a register → "movw %%cx, 2(%bp)" legal. Great, since "=r" guarantees register. So:
+
+```
+"movw %0, 4(%bp)\n\t"   /* A */
+"movw %1, 6(%bp)\n\t"   /* x */
+"movw %2, 6(%bp)\n\t"   /* y */
+"movw %3, 8(%bp)\n\t"   /* tmp */
+```
+Memory dest with reg source: fine.
+
+For m and n: use outputs? m and n: "m" inputs — they're fine as memory: then "movw %4, %%ax ; movw %%ax, 10(%bp)". Wait but if m operand is memory "m", %4 becomes like "-2(%bp)" (in caller-visible frame) — movw that into ax then to 10(%bp). OK.
+
+But do we even need m and n stored? We compare i<m and use n as loop count each iteration — reading from %4/%5 memory slots each time is fine: "movw %5, %%cx" per loop. Works and avoids extra storage. But referencing memory operands in-place (%5) inside loops is fine.
+
+Also n2 = 2*n: "movw %5, %%ax; addw %%ax, %%ax; movw %%ax, -6(%bp)".
+
+Now the register/clobber conflict: outputs "=r" for the four dummies, clobber ax,cx,dx — reload will avoid clobbered regs for outputs; allocatable: bx,si,di (+ cx? no clobbered). 4 dummy outputs need 4 regs but only bx,si,di free. Same problem! Unless dummies are not strictly "r"... Damn.
+
+Unless... m and n also could be "r" — worse.
+
+Reduce number of register inputs: only pointers really need registers? Alternative: read pointers via "m"... failed before.
+
+Hmm, what about passing the POINTERS as memory but in a way addressable: The earlier error "memory input 2 is not directly addressable" — memory inputs are the four arrays. It failed because operand was `A` where A is the parameter of type `DATA_TYPE (*)[N]` — hmm, that should be addressable... unless inline asm checks mode size? The message "not directly addressable" arises when gcc cannot make the operand addressable — for BLKmode? If operand type is an array type (not decayed), i.e., if we wrote "m"(A) where A's expression... A decays normally. Maybe the problem: POLYBENCH_2D_ARRAY_DECL creates A as `DATA_TYPE (*A)[N]` pointer variable — fine.
+
+Hmm wait, maybe the "not directly addressable" errors in PREVIOUS attempts were side effects of the undeclared identifiers (pA etc.), causing operand invalidation cascades! Indeed: memory inputs 2-5 = the four pointer operands with undeclared names — the frontend made error_mark_node operands and reported "not directly addressable" spuriously? plausibly. Since the codes `pA` etc. were undeclared, those "m" operands got malformed. So maybe "m"(A) works fine after all! And also attempt0 used 'Ap' etc.
+
+Interesting: both attempts attempted to use different pointer variable names, so both failed on names; addressability errors plausibly consequential. Which pointer variable names exist? The function signature: `DATA_TYPE POLYBENCH_2D(A,M,N,m,n), DATA_TYPE POLYBENCH_1D(x,N,n), ...`. With POLYBENCH_2D_ARRAY_DECL in main and POLYBENCH_ARRAY, but in kernel_atax parameters are plain A, x, y, tmp arrays (macro expands to A[m][n]... wait POLYBENCH_2D(var...) with POLYBENCH_ARRAY already applied; inside kernel, parameter declared as `DATA_TYPE A[M][N]`? POLYBENCH_2D(A,M,N,m,n) expands to `A[...][...]`. In polybench.h:
+
+```
+#define POLYBENCH_2D(var, dim1, dim2, hdim1, hdim2) var[hdim1][hdim2]
+```
+With hdim sizes M, N (compile-time). So parameter A is `DATA_TYPE A[M][N]` — a real array parameter (pointer). Fine.
+
+So attempt1 naming: m, n, A, x, y, tmp all exist. The current attempt is attempt1 presumably (errors mention pA undeclared...; attempt0 had Ap, Xp; both broken). The "memory input not directly addressable" for operands 2..5: in attempt0, operands were 0..5 with 2..5 being Ap,Xp,Yp,Tp (error nodes) → likely consequential. So with correct names "m"(A) may compile. But will gcc accept 'm' for A? If A is a parameter, gcc typically has it in a register (parameter pseudo); with 'm' constraint reload will spill it to stack — legal and addressable. Should be OK.
+
+But earlier attempt used those as inputs and pushed them as `"m"` — those errors were attributable to undeclared names. I'll go with "m" inputs for pointers, but careful with "two memory operands" in "pushw %0": if %0 is a stack memory operand, "pushw %0" is push mem — that's fine (push mem is legal, single memory operand!). Then sp-relative addressing to get it: after push bp; mov sp→bp, the pushed values are at (bp+2...) — actually they're pushed before bp: sequence:
+
+```
+pushw %0      /* pushes A pointer */
+pushw %1
+pushw %2
+pushw %3
+pushw %4      /* m */
+pushw %5      /* n */
+pushw %%bp
+movw %%sp, %%bp
+subw $6, %%sp
+```
+Frame: bp+0=old bp, bp+2=n, bp+4=m, bp+6=tmp, bp+8=y, bp+10=x, bp+12=A. `pushw %0` where %0 is memory operand — pushing memory operand, legal. If gcc decides %0 is an immediate? Pointer can't be immediate except constant folded (possible if A is constant address — static arrays with known addresses could become immediates! With small model, POLYBENCH_ARRAY(A) — A is a stack variable pointer... A is a local pointer variable, so not constant. OK but risk: if gcc decides %0 as immediate constant, "pushw $immediate" legal anyway. Either way push handles reg/mem/immediate — but our asm text "pushw %0" with a register operand: fine too. All good: push accepts any src.
+
+Better use "r" for everything and push at start, clobbering all six? Conflict issue again. With "m" for the four pointers + m,n: memory inputs, no register conflict, clobber everything. 
+
+But hmm: is "m"(A) valid when A is a pointer-to-array (an address)? The operand is the pointer variable A itself; its mode is HImode; 'm' fine. The arrays themselves are accessed indirectly through the pointer at runtime. But wait — how do we get the pointer VALUE into the asm asm? Operand is "m"(A) → evaluates A object (the pointer variable's memory). But hold on, "m"(A) where A has array type `DATA_TYPE[M][N]`? If the parameter is declared as array type it decays... In the operand "m"(A), if A is an array argument treated as a pointer, fine.
+
+Actually wait: does the earlier "not directly addressable" error correspond to the undeclared? The dedup shows both files had those errors; yes both attempts had bad names. So likely consequential.
+
+Another design point: instead of the complex frame, we could pass pointers as "m" and load them via placeholders into registers early. But "movw %0, %%bx" with memory operand: legal (mov mem,reg). Then free to clobber. That's simpler than pushing: but we must persist pointers across the computation: store into our own frame via bp as before.
+
+Choose frame approach with bp preserved via push/pop. Clobber: ax,bx,cx,dx,si,di,cc,memory. bp handled manually (push/pop).
+
+But CONFLICT: inputs "r"? Not needed; "m" inputs — for input m/n ints, and pointers as "m"(A) — memory input "A" (addressable? yes as spilled stack). Wait but A as a 2D-array-decayed... the operand "m"(A) means the memory holding pointer A. OK.
+
+But is it legal to clobber si if an input "m" doesn't need si? m operands are fine with any clobbers.
+
+Hmm, but earlier memory inputs were given "m" (attempt used "m"(pA)...) — errors were name undeclared. Attempt0 used pA? Attempt0: errors 'Ap' undeclared — names Ap, Xp, Yp, Tp presumably. attempt1: pA. Both name errors. So "m" might work.
+
+But "movw %0, %%bx" with memory operand → "movw -2(%bp_x), %%bx" — fine. But careful: our asm pushes bp and changes sp — the C frame's locals are relative to the ORIGINAL sp/bp. If a "m" operand is a negative sp offset (gcc uses sp-relative when no frame pointer... with functions, gcc uses bp if frame pointer is on; ia16-elf-gcc -fno-omit-frame-pointer default? Actually ia16 gcc relies on bp as frame pointer for stack frames typically). But safer to use push approach: push the four input operand values first, before touching bp/sp. Since "pushw %0" is register-or-memory safe. Order pushes so that after "push bp; mov bp,sp": bp+2 = last push.
+
+Push order: A, x, y, tmp, then m, n? We also want m,n: push %4? m and n as "m" could be registers (parameters in regs) — push reg fine; memory fine; immediate fine. So push all: A(0), x(1), y(2), tmp(3), m(4), n(5) → after push bp: bp+2=n... wait pushes: A at sp, then x covers... last pushed ends at bp+2. Push order: %A, %x, %y, %tmp, %m, %n, %bp. bp+2 = n, bp+4 = m, bp+6 = tmp, bp+8 = y, bp+10 = x, bp+12 = A. Locals: sub sp, $6: -2 = i? offsets below bp negative: bp-2, bp-4, bp-6.
+
+Hmm wait but pushing sp-relative %0: "pushw %0" if %0 is itself a stack slot — that's memory operand read; fine single-mem.
+
+But one more consideration: "m" operands for pointers produce warning about... no.
+
+Alternatively pass pointers as "r" and push — but clobber-all conflict. Use "m" for pointers! "m"(A) → memory operand → spilling parameters to stack — allowed, memory inputs don't conflict with clobbers. 
+
+But wait, is "m"(A) where A is parameter of array type... The operand type for pointer-to-array: gcc might treat "m" operand as the array itself with mode BLK? Decayed A is pointer expression; "m"(A) means memory of the POINTER. OK.
+
+Hmm, but earlier error "memory input 2 is not directly addressable" — I reasoned as consequential. There's a real risk though. Alternative: use "r" for pointers but clobber list excluding needed regs, with dummy-output trick to permit use... Let's count with generic: outputs: 4 dummy "=r"s +1? Dummy outputs would ALSO occupy registers... they occupy the same register as the input (matching). With "=r"(Aout) matching "0"(A): this reg is an output (dead), gcc will not treat as input→no conflict with clobber since we can list bx etc. But generic "=r" outputs and clobber list ax..di → reload must assign outputs to non-clobbered regs → only bp/sp fixed → fail.
+
+So explicit registers are needed somewhere. Given ia16 constraint letters: I'll go with push approach + "m" operands entirely — no register constraints at all! Operands: "m"(A), "m"(x), "m"(y), "m"(tmp), "m"(m), "m"(n). No register conflicts; clobbers free. "m" always satisfiable via stack spill. Register pressure: at asm entry gcc must place operands in memory — fine.
+
+The pushes: "pushw %0\n\t" — if operand is memory like -4(%some bp-based addressing)... gcc's addressing on ia16 to address its own frame uses sp or bp. When we push before modifying sp, values come from gcc's frame — stable. Good.
+
+Then after push bp/mov sp,bp: frame:
+- 2(%bp): n
+- 4(%bp): m
+- 6(%bp): tmp
+- 8(%bp): y
+- 10(%bp): x
+- 12(%bp): A
+
+Wait order: pushes happen in listed order; last pushed = %n sits at bp+2? Sequence: push %0(A): sp-2. push %1(x) ... last before bp is %5(n) at top, then push bp. After mov: bp = sp; bp+2 = push n, bp+4 = m, bp+6 = tmp, bp+8 = y, bp+10 = x, bp+12 = A. Then sub sp, $6 → locals: -2(%bp) i, -4(%bp) tmpval, -6(%bp) n2.
+
+Now write the code (fix addresses accordingly: earlier attempt had 10=n,12=m — recompute):
+
+n2: movw 10(%bp),%ax; add ax,ax; mov ax,-6(bp).
+Zero y: si=8(bp); cx=10(bp)... wait n = bp+2 now. Let me redo:
+- n at 2(%bp)
+- m at 4(%bp)
+- tmp ptr at 6(%bp)
+- y ptr at 8(%bp)
+- x ptr at 10(%bp)
+- A ptr at 12(%bp)
+
+Loop1: si=8bp (y), cx=2bp (n), ax=0; jcxz skip; loop: (si)=ax; si+=2; loop.
+
+Outer: bx=12bp (A); i(-2bp)=0.
+L3: tmpval -4bp=0.
+Inner1: si=10bp (x); di=0; cx=2bp(n); jcxz L5; L4: ax=(bx,di); imulw (%si); add ax,-4bp; si+=2; di+=2; loop.
+Inner2: si=8bp (y); di=0; cx=2bp; jcxz L7; L6: ax=(bx,di); imulw -4bp; dx=(si); add ax,dx; (si)=dx; si+=2; di+=2; loop.
+L7: store tmp: ax=-2bp; ax+=ax; si=6bp; si+=ax; dx=-4bp; (si)=dx.
+bx += -6bp (n2).
+i(-2bp)++; ax=-2bp; cmp 4bp... wait m at 4(%bp): cmpw 4(%bp), %%ax; jl L3.
+Restore: mov bp,sp; pop bp.
+
+Now labels with numeric local labels (2f/1b etc.) as before — GNU as supports those numeric labels; ia16 binutils yes.
+
+Also the operand placeholders %0..%5 appear in push lines. Note: with "m" constraint for pointers A etc., "pushw %0" — operand mode HImode pointer. ok.
+
+Potential issue: gcc might place pointer operands as registers actually (known values) — push reg fine. Immediate — push imm fine.
+
+Also "memory" clobber covers writes to y/tmp.
+
+One more: `cc` clobber for loop/flags.
+
+Also, previous attempt's cmp: "cmpw 12(%bp), %%ax" then jl — signed compare, fine (m>0). i vs m both ints.
+
+Check each instruction: 
+- "movw %0, ..."? not used; pushes only.
+- "imulw (%si)": imul r/m16 — op imul w — dx:ax. Wait we need result low in ax: yes.
+- "addw %%ax, -4(%bp)": add reg,mem? Form: addw %%ax, mem → AT&T: op src=%%ax? AT&T: addw source, dest: "addw %%ax, -4(%bp)" → add [bp-4], ax. Legal x86 (mem dest, reg source).
+- "movw %%dx, (%si)" fine.
+- "movw 4(%bp), %%dx"? not needed now.
+
+Also "imulw -4(%bp)": imul mem — dx:ax.
+
+Edge: jcxz needed if n=0 to avoid huge loop — harmless to keep.
+
+Register clobbers: ax,bx,cx,dx,si,di,cc,memory. bp manually preserved.
+
+Does the ia16 assembler accept "imulw" mnemonic as imul with w suffix — GNU as: imulw (%si) → yes.
+
+Potential problem: "movw %%ax, (%si)" then "addw $2, %%si" fine.
+
+Also label "3:" reused with "3b" later, jcxz "5f": numeric labels 1..7 unique-ish. Let me relabel cleanly:
+
+```
+    /* zero y */
+    "movw 8(%bp), %%si\n\t"
+    "movw 2(%bp), %%cx\n\t"
+    "xorw %%ax, %%ax\n\t"
+    "jcxz 2f\n"
+    "1:\n\t"
+    "movw %%ax, (%si)\n\t"
+    "addw $2, %%si\n\t"
+    "loop 1b\n"
+    "2:\n\t"
+    "movw 12(%bp), %%bx\n\t"
+    "movw $0, -2(%bp)\n"
+    "3:\n\t"
+    "movw $0, -4(%bp)\n\t"
+    "movw 10(%bp), %%si\n\t"
+    "xorw %%di, %%di\n\t"
+    "movw 2(%bp), %%cx\n\t"
+    "jcxz 5f\n"
+    "4:\n\t"
+    "movw (%bx,%di), %%ax\n\t"
+    "imulw (%si)\n\t"
+    "addw %%ax, -4(%bp)\n\t"
+    "addw $2, %%si\n\t"
+    "addw $2, %%di\n\t"
+    "loop 4b\n"
+    "5:\n\t"
+    "movw 8(%bp), %%si\n\t"
+    "xorw %%di, %%di\n\t"
+    "movw 2(%bp), %%cx\n\t"
+    "jcxz 7f\n"
+    "6:\n\t"
+    "movw (%bx,%di), %%ax\n\t"
+    "imulw -4(%bp)\n\t"
+    "movw (%si), %%dx\n\t"
+    "addw %%ax, %%dx\n\t"
+    "movw %%dx, (%si)\n\t"
+    "addw $2, %%si\n\t"
+    "addw $2, %%di\n\t"
+    "loop 6b\n"
+    "7:\n\t"
+    "movw -2(%bp), %%ax\n\t"
+    "addw %%ax, %%ax\n\t"
+    "movw 6(%bp), %%si\n\t"
+    "addw %%ax, %%si\n\t"
+    "movw -4(%bp), %%dx\n\t"
+    "movw %%dx, (%si)\n\t"
+    "addw -6(%bp), %%bx\n\t"
+    "incw -2(%bp)\n\t"
+    "movw -2(%bp), %%ax\n\t"
+    "cmpw 4(%bp), %%ax\n\t"
+    "jl 3b\n\t"
+    "movw %%bp, %%sp\n\t"
+    "popw %%bp"
+    :
+    : "m"(A), "m"(x), "m"(y), "m"(tmp), "m"(m), "m"(n)
+    : "ax", "bx", "cx", "dx", "si", "di", "cc", "memory");
+```
+
+Wait: "cmpw 4(%bp), %%ax" — cmp src,dest → cmp mem, ax: fine (one mem).
+
+Wrap in braces and volatile. Also "m"(A): the operand type of A — pointer to array — mode HImode; ok.
+
+One concern: "m" on `A` where A is array-typed param... decays? For asm operand, gcc decays arrays? If A declared `DATA_TYPE A[M][N]`, expression A in "m"(A) — array-to-pointer conversion applied? In GCC asm operand, array expressions are treated as their decayed pointer? I believe the operand value is the pointer (decay happens). The earlier direct-addressable error is consistent with the bad identifiers only... Actually hmm, "memory input is not directly addressable" was reported even in attempt0 for memory inputs 2..5 which correspond to the pointer operands (m,n are 0,1? In attempt0 operand list: "m"(m), "m"(n), "m"(pA), "m"(px), "m"(py), "m"(pt) → memory inputs 2-5 = the pointers). If names were undeclared, gcc error "undeclared" AND presumably treats as error_mark; does that yield "not directly addressable"? The operand would be an error type → could produce weird follow-ups. Similarly attempt1 with pA etc. So plausible.
+
+But there is a scenario where gcc-ia16 rejects "m" on these pointer-to-array parameters: if the parameter resides in a register (ia16 regparm), reload must spill; gcc is normally able to. I'll trust.
+
+Alternatively, safer belt-and-braces: use "p"? no.
+
+One more consideration: To reduce risk of "not directly addressable", we could take addresses of first elements? Passing "m"(A) directly should be fine for any addressable lvalue. `tmp` param is `DATA_TYPE tmp[M]` decayed pointer. Hmm, actually wait:are these parameters truly arrays? kernel_atax parameters: `DATA_TYPE POLYBENCH_1D(tmp,M,m)` expands to `tmp[m]` → `DATA_TYPE tmp[m]`? POLYBENCH_1D(var, dim1, hdim1) = var[hdim1] where hdim1 = m (runtime!). An Array parameter with runtime size — allowed in C99 VLA syntax as parameter! So tmp is a function parameter of VLA type DATA_TYPE[m]. DECAY: In a parameter list, arrays of VLA type are adjusted to pointer. So `tmp` has type DATA_TYPE* effectively (pointer to VLA). So "m"(tmp) is memory of that pointer. Should be addressable... unless gcc keeps it in register — spillable, fine.
+
+Hmm, but wait: the "not directly addressable" could ALSO be because VLA-typed parameters cause gcc-ia16 trouble... In attempt0/attempt1, the pointer operands were error nodes due to undeclared identifiers, so all these operand-related errors plausibly cascade.
+
+Given we can't iterate forever, choose design that maximizes compile success and correctness. I'll also avoid "pA" type mistakes: use actual names m, n, A, x, y, tmp.
+
+Also note: variables i, j declared before scop; we shadow with our own? We don't declare i/j; we use bp slot. Locals inside C region: we could keep `for` loops unrefactored? We replace whole loops with asm. Fine.
+
+Potential subtle issue: "pushw %0" when %0 is a memory operand whose addressing uses %sp? GCC's ia16 with frame pointer might reference its own stack frame using bp; we push operands BEFORE modifying sp — safe.
+
+However, if gcc expects us not to touch bp: we push bp and restore — same as previous attempt, presumably fine and previous attempt's assembly syntax itself was accepted (only operand-name errors were reported; no assembler errors since compilation stopped earlier?). The previous errors were all at compile (C) time, because operand names undeclared — assembly never got assembled! Attempt0 also had memory-input errors. So we don't know asm correctness. Our instructions are legal 8086 — double-check a few:
+
+1. "imulw -4(%bp)" — 8086 imul r/m16 with disp: yes.
+2. jcxz — 8086: yes (jcxz exists on 8086).
+3. loop — yes.
+4. numeric labels "1:" "1b" — GNU as: yes; also dedup OK.
+5. Displacement forms: 8(%bp), -2(%bp), (%bx,%di) — valid 8086.
+
+Memory operand ordering in imul: imulw (%si) computes DX:AX = AX * mem. Good.
+
+The store of tmp[i] uses si — after loop2, si points past y; reuse fine.
+
+Also should y zero loop use %ax=0 with DF? no strings.
+
+i loop compare: incw -2(%bp) increments memory — legal.
+
+One more thing: at "3:" movw $0, -2(%bp) sets i=0 — inside outer loop we re-zero each iteration? Previous attempt did movw $0, -2(%bp) before 3: actually in previous it was before label 3 ("movw $0, -2(%bp)\n 3:") — set once. Keep that (set i=0 before label 3).
+
+Alignment: previous had `"movw $0, -2(%bp)\n"` then `"3:"`. Keep same ordering.
+
+Also I should double check the "m" constraint for function parameters that are pointers-to-VLA: type of expression `A` is `DATA_TYPE (*)[N]` where N=compile-time? hdim N constant. Fine ordinary pointer.
+
+But one risk remains: "memory input is not directly addressable" if gcc treats whole arrays... To hedge, I could instead pass pointers via dummy outputs with tied inputs using generic "r":
+
+outputs: `: "=&r"(dummyA), "=&r"(dummyX), ...` hmm but dummy variable declarations needed in C region. That has its own constraint-pressure issue: 4 allocatable regs for 4 outputs, clobbers ax,cx,dx,+... if clobber excludes bx,si,di? We clobber everything... conflict again unless generic "r" outputs with clobbers NOT including their assigned regs — can't do generic.
+
+Explicit-register dummy outputs: `"=b"(dA)`, `"=S"(dX)`, `"=D"(dY)`, and dTmp? tmp pointer as "=a"? but "=a" output with input "1"? Use:
+outputs: "=b"(dA), "=S"(dX), "=D"(dY), "=a"(dT) with inputs "0"(A),"1"(x),"2"(y),"3"(tmp). Then clobber "cx","dx" only (+"cc","memory"). We're free to use ax,si,di,bx as outputs (dead). For computation we use bx,si,di mainly after copying to frame; dx,cx clobbered. This works with ia16 IF constraint letters a,S,D,b exist. I have moderate confidence gcc-ia16 defines 'a','b','c','d','S','D' (mirroring i386 naming). But NOT certain. Both approaches have risk; previous task-scoring: only errors caused... we must produce something that compiles.
+
+I think "m" pointer inputs are quite standard and likely accepted; the earlier error probably stemmed from undeclared identifiers making operands invalid (undeclared → rtx ERROR → "not directly addressable" follow-on). I'll go with "m".
+
+Additionally, to be safe about spilling: it's standard.
+
+Let me also double check requirement "Do not clobber ... later usage" — fine.
+
+Also POLYBENCH_2D with M,N constants: A is `DATA_TYPE A[M][N]`; in function params it's pointer; expression A in "m"(A) → the parameter variable. ok.
+
+Wait — could `A` be of type `DATA_TYPE (*)[N]` but gcc optimizes... fine.
+
+Also the DATA_TYPE for ia16: likely int (they set DATA_TYPE int for 8/16-bit targets). Keep integer ops.
+
+Also address `(%bx,%di)`: when A base large? fine.
+
+Final check: input order mapping: %0=A, %1=x, %2=y, %3=tmp, %4=m, %5=n. Push order %0..%5 then bp. bp+2=n yes (last pushed before bp is %5). bp+4=m(%4), bp+6=tmp(%3), bp+8=y(%2), bp+10=x(%1), bp+12=A(%0).
+
+Also potential edge: if any operand optimized to immediate (e.g., "m"(m) with m constant-folding? m is a volatile-ish variable—no). pushw %imm for constant operands allowed by as anyway. Actually can gcc choose "i"? We specified "m"; gcc must place in memory — will spill parameter to stack slot; push memory operand — fine.
+
+But "pushw %0" with memory operand: what addressing does gcc use for stack slot? On ia16, gcc typically uses bp for frame, sp for outgoing args. If it uses sp-relative (-N(%sp))... hmm if operands spilled to stack they'd be negative sp offsets in OUR asm they're computed before we change sp. Pushing sp-relative memory: pushw -4(%sp) — valid 8086? push r/m16 with SP base: mod/rm with base SP? On 8086, base SP is NOT a valid modrm base (only bx,bp,si,di combos; [bp+si] used with sp=bp trick). GCC ia16 knows its own addressing constraints and won't emit invalid forms; if frame needs sp-relative it uses bp as aux. Since our function has frame (arrays? none local; but parameters spilled), gcc would use bp-based addressing (frame pointer exists when parameters on stack...). rcx. Fine.
+
+But: does gcc ia16 for spills prefer callee-saved regs and memory via bp? Whatever — "m" operand correctness is gcc's responsibility.
+
+Now compose final answer inside braces? Return only replacement between pragmas — the asm block is a statement; keep as-is:
+
+__asm__ __volatile__ ( ... ) as a standalone statement. Previous attempt wrapped in __asm__ __volatile__ with trailing ; not needed inside region? Statement needs semicolon? The region previously ended with `: "ax", ...);` without trailing semicolon and presumably compiled as-expression? In previous attempt the block ended `: "ax", "bx", ..., "memory");` — expression statement without final `;`? Actually the asm( ... ) is an expression; the region is statements — needs `;`? In attempt0 attempt1 it ended with `);` and no semicolon afterwards — gcc would complain "expected ;"? Not reported... because compilation of those lines never happened region? The errors listed only operand issues; statement-without-semicolon error would also appear. It's not in the dedup list — maybe gcc stops? No, gcc continues. Hmm "memory input" errors reported then maybe parse errors... Safer to include trailing `;`? Statement-expression: `__asm__ __volatile__ (...);` includes semicolon. Previous attempt omitted? It ended `: "ax", "bx", "cx", "dx", "si", "di", "cc", "memory");`. If that parsed as expression statement, gcc error "expected ;". Since not in error list, maybe tokenizer... whatever, I'll add the semicolon.
+
+Add {} braces? Not needed.
+
+Write final code.
+
+Double-check n2 computation placement: before zero loop; uses bp frame (set after sub sp). Sequence:
+
+```
+"pushw %0\n\t"
+"pushw %1\n\t"
+"pushw %2\n\t"
+"pushw %3\n\t"
+"pushw %4\n\t"
+"pushw %5\n\t"
+"pushw %%bp\n\t"
+"movw %%sp, %%bp\n\t"
+"subw $6, %%sp\n\t"
+"movw 2(%bp), %%ax\n\t"   /* n */
+"addw %%ax, %%ax\n\t"
+"movw %%ax, -6(%bp)\n\t"
+```
+
+Then loops as above.
+
+Also verify offsets again: 2=n,4=m,6=tmp,8=y,10=x,12=A. Yes.
+
+Final inner loop 1: tmp accumulation "addw %%ax, -4(%bp)" fine. Wait but ax after imul low in ax — yes dx:ax result; ax low.
+
+But careful: inner loop1 uses di as index of A row AND x advanced in si. Good. "imulw (%si)" — plus we keep x[j] at (%si): yes.
+
+y zero: ax=0; loop count n.
+
+Store tmp[i]: uses ax, si, dx.
+
+bx advance: "addw -6(%bp), %%bx" → add mem to bx: add [bp-6], bx legal.
+
+i increment: incw -2(%bp) legal; then mov -2bp,ax; cmpw 4(%bp), %%ax; jl 3b.
+
+Restore: movw %%bp, %%sp; popw %%bp.
+
+Output operand section empty; inputs six "m". Also add "SI","DI"? Clobber names with %% prefixes as "si" lowercase in clobber list — fine.
+
+One concern: clobbering bx, si, di — on ia16 these are caller-saved? bx is callee-saved traditionally; gcc knows we clobbered so it handles. OK.
+
+Also add "dx" as we use dx. "cc".
+
+Note: also we might add "bp"? No — we preserve manually; declaring bp clobber would break frame.
+
+I think good. Also must the asm handle DF? unchanged.
+
+Write it.

@@ -26,12 +26,20 @@ RESULT_ORDER = ["pass", "mismatch", "no_output", "run_fail", "build_fail",
                 "timeout", "api_error"]
 
 
+def run_dirs(parent):
+    """Every immediate subdirectory (whatever its name) that holds a comparison.csv.
+
+    Was hardcoded to ``x86_*`` (the 8086 repeats already existed as
+    ``llm_compare_*_rNN`` dirs but aggregated to an empty repeated.csv — the
+    parent dir held only those, so an unbounded join would catch stray files)."""
+    return sorted(d for d in glob.glob(os.path.join(parent, "*"))
+                  if os.path.isdir(d) and os.path.isfile(os.path.join(d, "comparison.csv")))
+
+
 def iter_cell_rows(parent):
     """Yield (result, rep_label, cell_row dict) for every cell in every repeat run."""
-    for run in sorted(glob.glob(os.path.join(parent, "x86_*"))):
+    for run in run_dirs(parent):
         csvp = os.path.join(run, "comparison.csv")
-        if not os.path.isfile(csvp):
-            continue
         for row in csv.DictReader(open(csvp)):
             # skip any aggregator / stray rows
             if not row.get("kernel"):
@@ -48,11 +56,10 @@ def main():
     cells = {}
     n_runs = 0
     for row, rep in iter_cell_rows(args.parent):
-        n_runs = max(n_runs, 0)  # count dirs below separately
         key = (row["kernel"], row["alias"], row.get("category", ""))
         cells.setdefault(key, []).append(row["result"])
-    run_dirs = sorted(glob.glob(os.path.join(args.parent, "x86_*")))
-    n_runs = len(run_dirs)
+    run_dirs_ = run_dirs(args.parent)
+    n_runs = len(run_dirs_)
 
     outp = args.out or os.path.join(args.parent, "repeated.csv")
     with open(outp, "w", newline="") as f:

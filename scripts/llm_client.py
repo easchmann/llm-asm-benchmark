@@ -119,12 +119,18 @@ def resolve_model(alias, *, timeout=REQUEST_TIMEOUT, base_url=None, api_key=None
 
 
 def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
-             base_url=None, api_key=None):
-    """One chat/completions round trip with a fresh random seed, retrying transient
-    gateway failures (504/502/503/429/timeouts) with exponential backoff.
+             base_url=None, api_key=None, temperature=None, top_p=None, seed=None):
+    """One chat/completions round trip, retrying transient gateway failures
+    (504/502/503/429/timeouts) with exponential backoff.
+
+    Sampling: by default a fresh random seed is used and temperature/top_p are left to
+    the gateway defaults (exactly the behaviour of the 2026-09-29 runs). Pass
+    temperature/top_p/seed to make the call deterministic / sweepable (Phase-1 decode
+    tuning); whatever was actually sent is returned under sampling_params so every
+    llm_calls.jsonl record self-describes its own sampling.
 
     Returns dict(content, underlying_model, usage, cost_usd, key_spend_total_usd,
-                 finish_reason, elapsed_seconds, reasoning).
+                 finish_reason, elapsed_seconds, reasoning, sampling_params).
     Raises LlmError on failure (HTTP errors carry usage/cost read from the gateway).
     content=None is reported as LlmError ("empty content ...") and is NOT retried here;
     callers decide whether raising the token cap makes sense (see generate_with_repair)."""
@@ -133,10 +139,14 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
     if not api_key:
         raise LlmError("set RIVAULT_API_KEY first")
 
-    seed = random.randint(1, 2**31 - 1)
+    seed = random.randint(1, 2**31 - 1) if seed is None else seed
     body_dict = {"model": alias, "messages": [{"role": "user", "content": prompt}], "seed": seed}
     if max_tokens is not None:
         body_dict["max_tokens"] = max_tokens
+    if temperature is not None:
+        body_dict["temperature"] = temperature
+    if top_p is not None:
+        body_dict["top_p"] = top_p
     body = json.dumps(body_dict).encode()
     req = urllib.request.Request(
         f"{base_url}/chat/completions", data=body,
@@ -237,6 +247,8 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         "finish_reason": finish_reason,
         "elapsed_seconds": elapsed,
         "reasoning": message.get("reasoning_content"),
+        "sampling_params": {k: body_dict[k] for k in ("temperature", "top_p", "seed")
+                            if k in body_dict},
     }
 
 

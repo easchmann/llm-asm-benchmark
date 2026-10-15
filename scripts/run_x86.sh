@@ -144,12 +144,22 @@ for k in "${kernels[@]}"; do
         if [ "${X86_VALUES_CHECK:-1}" != "0" ]; then
             values_args="--values-check --native $native"
         fi
+        # Sampling knob for the Phase-1 decode sweep: default sends nothing (gateway
+        # defaults, matching the 2026-09-29 runs); set X86_TEMPERATURE/TOP_P/SEED to
+        # sweep. Each sent value is recorded per-call in llm_calls.jsonl.
+        sampling_args=""
+        [ -n "${X86_TEMPERATURE:-}" ] && sampling_args+=" --temperature $X86_TEMPERATURE"
+        [ -n "${X86_TOP_P:-}" ] && sampling_args+=" --top-p $X86_TOP_P"
+        [ -n "${X86_SEED:-}" ] && sampling_args+=" --seed $X86_SEED"
+        # single-shot baseline: X86_SKIP_REPAIR=1 -> no compiler-repair, no values-repair
+        [ "${X86_SKIP_REPAIR:-0}" = "1" ] && sampling_args+=" --skip-repair"
         python3 "$ROOT/scripts/generate_with_repair.py" --kernel "$k" --src "$src" --out "$gen" \
             --alias "$alias" --log "$RESULTS/llm_calls.jsonl" --prompt-template "$PROMPT" \
             --work-dir "$WORK" --cc gcc --polybench-c "$UTIL/polybench.c" --kernel-dir "$kdir" \
             --extra-c-flags "$flags" --link-math \
             --exe "$WORK/${k}__${slug}" --max-repairs "${MAX_REPAIRS:-2}" \
-            --max-values-repairs "${MAX_VALUES_REPAIRS:-2}" ${values_args:+$values_args} $dry
+            --max-values-repairs "${MAX_VALUES_REPAIRS:-2}" ${values_args:+$values_args} \
+            $sampling_args $dry
 
         st="$WORK/${k}__${slug}.status"
         if [ ! -f "$st" ]; then
@@ -203,8 +213,14 @@ else:
             fi
             if [ "$rc" -eq 124 ]; then result=timeout
             elif [ "$rc" -ne 0 ]; then result=run_fail
-            elif diff -q "$native" "$out" >/dev/null; then result=pass
-            else result=mismatch
+            else
+                # grade through the shared dump-aware grader (same TOL as the Python
+                # values loop) so a run that produced no real DUMP_ARRAYS block is
+                # counted as no_output, not mismatch (the 8086 boot-junk bug).
+                grade=$(python3 "$ROOT/scripts/llm_runner.py" --grade --native "$native" \
+                    --out "$out" --dump-only 2>/dev/null)
+                result=$(echo "$grade" | awk '{print $1}')
+                [ -z "$result" ] && result=mismatch
             fi
         fi
         echo "$k,$alias,$category,$compiled,$result,$repairs" >> "$SUMMARY"

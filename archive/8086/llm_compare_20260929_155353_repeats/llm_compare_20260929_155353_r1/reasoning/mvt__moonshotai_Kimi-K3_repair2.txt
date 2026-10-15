@@ -1,0 +1,994 @@
+The errors are:
+1. `mvt_asm_n` undeclared - this suggests the attempt0.c used different operand names. But the PREVIOUS_ASM shown uses %[n], %[x1], etc. The errors mention mvt_asm_n, so maybe there was a wrapper or the output variables. Actually the errors reference line 140-145 with `mvt_asm_n` undeclared — perhaps the harness creates variables? Hmm. Actually the deduplicated errors from two attempts: attempt0 errors about undeclared identifiers and "memory input N is not directly addressable". The "memory input is not directly addressable" is because "m" constraint on a parameter array like x1 (which decays to pointer) — `x1` is a pointer variable (function parameter), using "m"(x1) should be address of pointer... Actually "m" constraint requires the operand to be a memory operand; taking `x1` which is a parameter (pointer) stored in memory should be fine. But POLYBENCH_1D macro might make it `x1[restrict N]`? The parameters are declared as `DATA_TYPE POLYBENCH_1D(x1,N,n)` which expands to something like `DATA_TYPE x1[POLYBENCH_RESTRICT N]` — parameters adjusted to pointer. Using "m"(x1) gives the memory location of the pointer variable itself, which should be directly addressable... unless the compiler passes them in registers? At 16-bit with regparm? ia16-elf-gcc might use regparm for static functions? Possibly the parameters get optimized into registers and "m" constraint fails: "memory input 0 is not directly addressable". Better to use "r" constraints to load pointer values into registers.
+
+The undeclared identifiers mvt_asm_n etc.——prev attempt0 probably had separate code. Not relevant now; we just need to use operand names that exist: n, x1, x2, y_1, y_2, A.
+
+2. FPU instructions not supported on i8086: no 8087. So we need software floating point? DATA_TYPE is double presumably. Without an FPU, we'd need to call software floating-point routines (_adddf3, _muldf3 from libgcc). That's complex in inline asm. Alternatively compile with -m80387? The target may not allow. The assembler says `fld` not supported on i8086, so we must avoid x87 instructions. Options: call libgcc functions __adddf3, __muldf3. In ia16-elf-gcc, doubles are 64-bit? DATA_TYPE default in polybench is double. Software floating point library functions exist. Calling convention: first args pushed on stack (cdecl, since 8086 has limited regs; ia16-elf-gcc follows... let me recall: ia16-elf-gcc uses a calling convention where args passed on stack? Actually ia16-elf-gcc passes first few args in registers? Let me recall: The ia16-elf-gcc target uses regparm? I believe ia16-elf-gcc uses a convention similar to... For far code model... Hmm.
+
+ia16-elf-gcc (tkchia's GCC for 16-bit x86) uses by default __attribute__((cdecl))? The default calling convention: arguments passed on the stack, caller pops. Functions can be declared with regparm. Libgcc functions like __adddf3 follow standard convention: args on stack.
+
+So inline asm could push the 8 bytes of the two doubles? On 8086 we can't push memory directly (push mem is available on 286+ actually; 8086 push r/m16? PUSH r/m16 is valid on 8086? Yes! PUSH r/m16 (opcode FF /6) is valid on 8086. And PUSHA is 286. PUSH imm is 286. So we can push word ptr memory operands.)
+
+But we need offsets like 6(%bx) with word access: "pushw 6(%bx)" etc. In AT&T syntax with ia16 gas, `pushw 6(%bx)`. Addressing modes on 8086: (%bx), (%si), (%di), (%bp), (%bx,%si), (%bx,%di), (%bp,%si), (%bp,%di) with disp. Not (%bx,%dx). Our previous code uses (%%bx), (%%si), (%%di) - fine.
+
+Plan: implement double add and multiply via calls to __muldf3 and __adddf3. But calling these inside inline asm clobbers registers unpredictably (ax,dx,cx,bx maybe). Libgcc functions compiled for ia16 may use and clobber caller-saved regs: ax, cx, dx. Callee-saved: bx, si, di, bp. So keep pointers/counters in bx, si, di, and maybe store loop counter in memory or use bp? bp is frame pointer; asm volatile clobbering bp problematic. We can push/pop around calls.
+
+Alternative: Use integer arithmetic? DATA_TYPE might be double by default in mvt.h. mvt.h defines DATA_TYPE as double (POLYBENCH default). We cannot change headers. We must output inline asm only between pragma markers. So implement with software FP calls.
+
+Simpler approach: write nested loops in inline asm, calling __muldf3 and __adddf3, saving our loop state on stack around calls.
+
+Let's design.
+
+Variables: n (int), x1, x2, y_1, y_2 are pointers (DATA_TYPE *), A is pointer to 2D: DATA_TYPE (*A)[N]? Parameter `DATA_TYPE POLYBENCH_2D(A,N,N,n,n)` expands to `DATA_TYPE A[POLYBENCH_RESTRICT N][N]`? In function parameter it's pointer to array of N doubles. We can use "m"(A)? The memory input not directly addressable error arises because the function parameters might be optimized (stored in registers?) Actually parameters at O0 are on stack; but the error occurred presumably because the compiler tried to make a memory operand for an expression that isn't directly addressable—"m"(x1) where x1 is a parameter should be addressable... unless POLYBENCH_1D includes restrict and array subscript making x1 an array type? In parameter position, array type decays. Hmm "memory input 0 is not directly addressable" typically happens when the operand is a global register variable or a constant. Could happen if "m" operand is `(x1)` where x1 is `DATA_TYPE *` parameter — that is memory. But maybe the harness benchmark compiles with -O2 and parameters passed in registers due to static function with regparm? ia16-elf-gcc might default to regparm(3) for static functions? I think ia16-elf-gcc uses regparm? Let me recall: tkchia's ia16-elf-gcc: "By default, function arguments are passed on the stack; however you can use regparm"... Actually for 16-bit x86 there is -mregparm=3 option; default? I recall default is regparm=0 (stack). Not sure.
+
+The safest: use "r" input constraints: load pointer into register operand, e.g. [x1] "r" (x1). Since pointers are 16-bit (small memory model), "r" gives a 16-bit reg. For n, "r"(n). But inside asm we need specific registers; with "r" constraints we get arbitrary regs which we can reference via %1 etc. But mixing named operands and explicit register usage: we can movw %[x1], %%di, etc. That avoids the addressability problem because "r" accepts anything.
+
+However, since we use "memory" clobber and volatile, fine.
+
+Concern: with "r" constraint and the operand being a 16-bit value, fine.
+
+Also we must ensure that asm volatile with calls: the called functions __muldf3/__adddf3 must exist; libgcc provides them for soft-float. ia16-elf-gcc for 8086 without FPU: double arithmetic is done in software. Yes, __adddf3, __muldf3 should be in libgcc.
+
+Calling convention details: standard cdecl: push args right-to-left, caller adjusts stack. Return value: for 64-bit double, returned how? In ia16-elf-gcc, functions returning double (64-bit) maybe return in... For soft-fp, likely returned in registers ax,dx? Or in memory via hidden pointer? Hmm. Many 16-bit compilers return 32-bit in dx:ax and 64-bit... For ia16-elf-gcc, I recall that 64-bit values are returned in dx:ax (only 32 bits?) No—could be in ax:bx:cx:dx? Hmm.
+
+Let me think: ia16-elf-gcc is a real-mode 16-bit toolchain. Its ABI: I believe aggregate and large types returned via hidden first argument (pointer), per SYSV-ish conventions. For int64_t / double return... For i386 SYSV, 64-bit ints returned in edx:eax. For ia16, probably 64-bit returned in... maybe on the "floating point stack" like 8087 if hard-float; with soft-float, __adddf3 could return in registers. Actually libgcc's __adddf3 is compiled from C, returns double; the backend decides. For x86_16 backend (ia16), HImode pointers. The FUNCTION_VALUE for DFmode: possibly in AX:BX:CX:DX? Let me recall ia16 backend docs: In the ia16 gcc backend (config/ia16), values are returned in AX for HImode/SImode in DX:AX? For DImode (64-bit) maybe in AX,DX,CX,BX? Hmm.
+
+I remember the ia16 port defines: "Function return values: up to 32 bits in ax (and dx for 32-bit). For 64-bit, in ax, dx, cx, bx" perhaps. Let me search memory: In tkchia's libi86 or in the ia16 GCC: `ix86_return_in_memory`? The ia16 backend was based partly on x86 backend. For 16-bit, maybe 64-bit returned via memory (hidden pointer) because not enough registers. Hmm.
+
+Actually, I recall that ia16-elf-gcc ABI: function arguments passed on stack; return value in %ax (16 bits) or %dx:%ax (32 bits); 64-bit values in %ax:%bx:%cx:%dx? There is mention: "long long is returned on the stack"? Unclear.
+
+Safer approach: avoid function calls for FP; implement double multiply/add in integer asm? That's very heavy.
+
+Alternative: maybe DATA_TYPE could be float for this benchmark? The default in mvt.h: `#define DATA_TYPE_IS_DOUBLE`? PolyBench mvt default uses double. The problem statement's code earlier: `fldl (%%bx)` with 8-byte loads previous attempt, the assembler rejected only because i8086 doesn't support fpu instructions (prefix fwait etc. not allowed? Actually 8087 instructions are supported by gas for i8086 if -m8087? They got "not supported on i8086" errors). So perhaps compile flags include -mno-80387. We cannot change flags.
+
+We could still perform FP via library calls. Need ABI correctness. Let's determine ia16-elf-gcc's double return convention.
+
+From gcc/config/ia16/ia16.c (tkchia): I recall reading: "Return values are placed in %ax, %dx:%ax, %ax:%bx:%cx:%dx" maybe. There is a known document: "ia16-elf-gcc: RISC style, usage: %ax, %cx, %dx caller-save; %bx?" Hmm typical x86: bx, si, di, bp callee-saved.
+
+Let me recall from the ia16 backend (config/ia16/constraints.md etc.). The ia16 port classifies registers: AX_REGS, etc. Function value: `ia16_function_value` perhaps returns in AX for mode size <= 2, DX:AX for <= 4, and for 8 bytes... `gen_rtx_REG (mode, AX_REG)` might not support >4 bytes in regs, so it returns in memory via hidden pointer. In GCC, if the return value doesn't fit in the natural return registers, `TARGET_RETURN_IN_MEMORY` returns true; then the caller passes a hidden first arg pointer to a buffer, and the function returns pointer in ax.
+
+For i386, 64-bit int fits in edx:eax so not memory. For ia16 with 16-bit regs, GCC's x86 backend macros `x86_rtx...`; The ia16 backend might define that DImode returns in memory. Let me recall actual experience: people wrote code with ia16-elf-gcc using `long long` arithmetic (e.g., 64-bit division calls __udivdi3). The function __udivdi3 returns di (64-bit). How is it returned? I believe ia16 returns 64-bit in `%eax`? no. Hmm.
+
+Search memory: In libgcc/config/ia16? Actually there is no ia16 assembly for soft-fp; it's compiled C. Newlib for ia16... I recall in the ia16 port, `long long` values are returned in `%ax:%bx:%cx:%dx`. There's a known ABI doc (from the FreeDOS / OpenWatcom comparison? no).
+
+Let me think about tinkering: In gcc/config/ia16/ia16.c, there is:
+
+```
+static rtx
+ia16_function_value (const_tree valtype, const_tree fntype, bool outgoing)
+{
+  return gen_rtx_REG (TYPE_MODE (valtype), AX_REG);
+}
+```
+
+If so, a DFmode register in AX_REG — GCC allows multiword regs starting at AX: AX,DX,CX,BX presumably (hard reg nregs computed). That would mean double returned in ax:bx:cx:dx? The register order for multiword: consecutive hard regs (physical ordering). Physical reg order in x86: AX=0, DX=1? In gcc i386 reg ordering: { ax, dx, cx, bx, si, di, bp, sp } maybe. GCC i386 machine description defines register numbers: eax=0, edx=1, ecx=2, ebx=3, esi=4, edi=5, ebp=6, esp=7. If ia16 shares, then a DFmode value in reg 0 occupies regs 0..3 = AX, DX, CX, BX. So a 64-bit return in AX:DX:CX:BX (low word in AX, then DX, CX, BX high). Similarly SImode in AX:DX (low in AX, high in DX).
+
+Arguments on stack: standard.
+
+libgcc __muldf3(a,b) with a, b pushed as two 8-byte args: push b high words then... right-to-left: push b (8 bytes: high word first so that low address holds lowest word), then a. On little-endian with stack growing down, to lay 8-byte arg at lower addresses with least significant word at lowest address, push words from most significant to least significant. "pushw 6(%si)" etc.
+
+Return: in registers AX (bits 0-15), DX (16-31), CX (32-47), BX (48-63). I'm fairly confident? Not 100%. Alternative is hidden pointer. Hmm.
+
+Let me look for evidence: tkchia ia16 gcc, file gcc/config/ia16/ia16.c contains function `ix86_function_value_regno_p`? The ia16 port might override `TARGET_FUNCTION_VALUE` to return 64-bit in multiple regs AX,DX,CX,BX. I have a vague memory from discussions that on ia16, `int64_t` returns in `%ax, %dx, %cx, %bx` — an unusual ABI that requires care. Yes, I recall from tkchia's gcc-ia16 documentation: "large return values (up to 8 bytes?) are returned in registers ax, dx, cx and bx". Let me go with that: result word0=ax, word1=dx, word2=cx, word3=bx.
+
+Wait, there is nuance: args pushed on stack; callee may clobber ax,bx,cx,dx? For __muldf3 the result occupies ax,dx,cx,bx so all four are clobbered. Caller-saved. si, di preserved (callee-saved). bp, sp preserved. Flags clobbered.
+
+So keep pointers in si, di; counters: we need at least two counters plus two base pointers plus running pointer(s). Let me allocate:
+
+- Keep n on stack at fixed位置 via our own stack allocation? We can push input regs. Or use memory operands from C via "m"? The "m" issue: memory input not directly addressable—maybe only for the array parameters? For `int n` local param, "m"(n) should be addressable. The errors listed memory inputs 0-5 all not addressable, including n. That suggests all params register-allocated? Possibly compiled with -O2 and kernel_mvt inlined? static function could be inlined into main; then parameters become registers/constants and "m" fails. Yes! Since kernel_mvt is static and called once, GCC inlines it (or clones). After inlining, n might be constant (N macro!). Indeed `n = N` constant. x1 etc are malloc'd pointers in registers. So "m" fails. Use "r" constraints for everything. n may be an immediate (constant) when inlined — "r" works (loads into reg).
+
+Also note _PB_N macro: in kernel they use _PB_N which equals n (int). We can just use n operand.
+
+Now, because it's inlined, our asm block appears in main; fine.
+
+Register plan:
+
+Inputs:
+- nreg: load %[n] into some reg, we can keep in a reg across loops? Calls clobber ax,dx,cx,bx. So keep n in si or di? We have pointers x1,x2,y1,y2,A all needed. Available callee-saved regs: si, di, bx(special? callee-saved), bp (frame, can't clobber in inline asm typically; we could but GCC may use bp as frame pointer; clobbering bp in clobber list on ia16 might be disallowed "cannot be used in asm here"? Usually allowed with warning?). Let's plan to store loop counters on our own stack area or push/pop around calls.
+
+Simplify: Since between calls we do two calls per element: __muldf3 then __adddf3. Structure per element:
+- Compute A[i][j] address -> pointer in si (callee-saved).
+- y[j] address -> di (callee-saved but we also need x1[i] pointer...). We can maintain x1[i] pointer by pushing.
+
+Let me restructure loops:
+
+Loop1: for i: for j: x1[i] += A[i][j]*y1[j].
+
+Inner loop iteration uses three pointers: pA (to A[i][j]), pY (to y1[j]), pX (to x1[i], invariant within inner loop). And counter j.
+
+Registers callee-saved: bx? Is bx callee-saved in ia16? Standard x86: yes bx, si, di, bp callee-saved. But bx is used to return 64-bit (4th reg) from libgcc multi-word return — if the ABI returns in ax,dx,cx,bx, then __muldf3 as a normal function — wait if the function returns DFmode in those 4 regs, then bx is clobbered by __muldf3 even though normally callee-saved. __muldf3 itself must preserve its own callee-saved regs per ABI: the ABI return regs are caller-saved effectively. If bx can hold return value, then bx is call-clobbered in this ABI? That's unusual. Actually GCC's call-clobbered set is defined by CALL_USED_REGISTERS. If BX is in the return-value regs for 8-byte modes, then it must be call-used (clobbered). In i386, ebx is callee-saved and never part of return. For ia16, to return 64-bit in regs they may have made bx call-clobbered. Hmm, that would mean only si, di are safe across calls (besides bp/sp). That's typical: many 16-bit ABIs have only si, di as truly preserved across calls when 64-bit returns are allowed. So keep everything except si/di on stack.
+
+We could avoid relying on return register ABI ambiguity by checking how GCC returns `long long` on ia16... I recall from actual tests: In ia16-elf-gcc, 64-bit return is in `%dx:%ax`? no that's 32. Hmm.
+
+Let me try to recall the real ia16.c source. The ia16 backend (by Rask Ingemann Lambertsen) — `config/ia16/ia16.c`. I vaguely remember:
+
+```
+/* Implement TARGET_FUNCTION_VALUE.  */
+static rtx
+ia16_function_value (const_tree returntype, const_tree fntype_o fndecl, bool outgoing ATTRIBUTE_UNUSED)
+{
+  machine_mode mode = TYPE_MODE (returntype);
+  if (GET_MODE_SIZE (mode) > 4)
+    return NULL_RTX; /* return in memory */
+  if (GET_MODE_SIZE (mode) > 2)
+    return gen_rtx_REG (mode, AX_REG); /* dx:ax */
+  return gen_rtx_REG (mode, AX_REG);
+}
+```
+
+Not sure. Hmm.
+
+Alternative that sidesteps ABI: don't call libgcc; implement the entire double math inline via integer ops? Extremely long.
+
+Alternative sidestep: Use `fld` etc. but assembler rejects. What about emitting machine code bytes with .byte directives for x87 opcodes? The hardware is 8086 with no FPU? If the program runs on an emulator without FPU, x87 instructions would fault. But benchmarks perhaps just compile/run in an emulator? They said target is Intel 8086 — no 8087. Using .byte to sneak FPU instructions would compile, but at runtime invalid opcode if no coprocessor... Though maybe they run with an FPU? Risky and also wrong per "8086" spirit.
+
+Better: figure out correct ABI. The ia16-elf-gcc is tkchia's GCC (g fork). Let me recall from its docs (gcc-ia16's wiki / README):
+
+I recall reading the ia16 ABI: "Functions that return values in registers use %ax for 16-bit, %dx:%ax for 32-bit, and %bx:%dx:%ax"? Hmm.
+
+Actually there's a known subtlety: ia16 returns 64-bit in `%ax, %dx, %cx, %bx`, and this makes `%bx` call-clobbered, unlike i386. I think I read in the gcc-ia16 manual: "Unlike 32-bit x86, %ebx is not callee-saved; long long and double are returned in %ax:%dx:%cx:%bx." Let me search memory of "CALL_USED_REGISTERS" for ia16: maybe { ax, bx, cx, dx = call-used; si, di, bp, sp fixed/saved } — that's exactly WATCOM-ish? OpenWatcom uses ax,dx,cx,bx as scratch. GCC ia16 maybe inherited from the "x86 16-bit" convention used by bcc (Bruce Evans C compiler): bcc uses ax,bx,cx,dx scratch; si,di preserved; bx is used as "temporary" indeed. ELKS/bcc convention: functions return long in dx:ax (or ax:bx?). For bcc, 32-bit long returned in... bcc returns long in bx:ax? I recall dev86/bcc: longs returned in dx:ax. Hmm.
+
+Given the uncertainty, maybe test-free approach: avoid depending on exact multi-reg return by not using return value in registers; instead make the calls in a way GCC-independent: we can call helper routines we define? We can't define new functions (only asm block). But inside asm we could write local subroutines with our own convention! E.g., implement soft-float multiply and add ourselves... too big.
+
+Alternative: call __muldf3 but retrieve result from memory: We could structure the call by allocating a hidden buffer and relying on struct-return convention... but we don't know.
+
+Better: empirically infer from previous compile? Not available.
+
+Hmm, maybe easier: avoid libgcc __*df3 ABI entirely by generating calls to memcpy? no.
+
+Alternative approach: Use integer arithmetic if DATA_TYPE is int? PolyBench DATA_TYPE default is double. mvt.h:
+
+```
+# if !defined(DATA_TYPE_IS_INT) ...
+#  define DATA_TYPE double
+```
+
+Default double.
+
+OK so need software FP.
+
+Let me deeply recall ia16 ABI from the actual gcc/config/ia16/ia16.c (I've seen this file):
+
+From memory of browsing tkchia/gcc-ia16: 
+
+```
+/* Return in reg or memory.  */
+static bool
+ia16_return_in_memory (const_tree type, const_tree fntype)
+{
+  return (int_size_in_bytes (type) > 8) || ...
+}
+```
+
+Hmm I really can't recall precisely.
+
+Let me recall the register class definitions. i386.h defines FIXED_REGISTERS etc. The ia16 port is separate (config/ia16/ia16.h). I recall:
+
+```
+#define FIXED_REGISTERS \
+/*ax*/ 0, /*bx*/ 0?, ...
+```
+
+Honestly uncertain.
+
+Let's search memory of reading ia16.h register order:
+
+```
+enum reg_class
+{
+  NO_REGS,
+  AREG, DREG, CREG, BREG, SIREG, DIREG,
+  ...
+```
+
+Hmm.
+
+Alternative plan: Use calls to GCC builtins via C? We only output the asm block; but we can include C code? The requirement: "Return only the code replacement that goes between the two #pragma markers" — must be one asm() block presumably; could we include plain C loops? The region must be replaced with "equivalent 8086 assembly" as an asm block. The checker probably just compiles the whole file with our replacement text. We could technically write C code there, but the task says write asm. Previous attempts used asm; errors focus on asm. Let's produce a robust asm block.
+
+To handle ABI uncertainty around __muldf3, perhaps we can avoid multi-word return ambiguity by using the GCC libcalls but reading result from the stack? No.
+
+Another approach: implement double addition/multiplication manually using integer instructions with .byte-free pure asm. That's a substantial but deterministic solution. But polybench DATA_TYPE double computations need rounding correct-ish? To pass correctness check, results must match reasonably (typical benchmark harness compares outputs with tolerance? The harness 'print_array' dumps x1, x2; the grader may compare against reference output, maybe with tolerance). Software FP libgcc results would be correctly rounded; our hand implementation would need same rounding to match bits. If grader uses tolerance (like 1e-3?), close enough math could pass. But implementing full IEEE double multiply/add with rounding in 8086 asm inline is huge and error-prone.
+
+Thus libgcc calls are the right approach. Let me settle the ABI via stronger memory.
+
+ia16-elf-gcc by tkchia: I have seen disassembly of `double d_add(double a, double b){return a+b;}`? The generated code calls __adddf3 and then... Since __adddf3 returns double, and caller must do something. If return were in ax,dx,cx,bx, caller would just keep them. People have discussed: "On ia16, DFmode values are returned in %ax, %dx, %cx and %bx" — I genuinely recall something like this from the port's TARGET_FUNCTION_VALUE: it uses PARALLEL? GCC can return multi-reg via PARALLEL only for `FUNCTION_VALUE`... Actually straightforward: reg DFmode in AX_REG spans AX,DX,CX,BX given reg numbering ax=0,dx=1,cx=2,bx=3.
+
+Also arguments: are 64-bit args passed on the stack or in regs with regparm? Default -mregparm? For ia16, default regparm maybe 0? If inlined, our libcalls are explicit `call` instructions we write; pushing args on stack follows the default convention used by libgcc (compiled with default). So stack calling convention with caller cleanup.
+
+Order of 8-byte arg on stack: The arg is stored little-endian (word 0 lowest). When calling, caller pushes args right-to-left; for each double, pushes... GCC on 8086 can't push 8 bytes in one go; generated code would push word ptr [a+6], [a+4], [a+2], [a]. So push most-significant to least significant. We'll mimic.
+
+Which libgcc names? For soft double: `__adddf3`, `__muldf3`. These are in libgcc (soft-fp). ia16 libgcc built with soft-float: yes.
+
+Stack alignment: 8086 no alignment requirement.
+
+Now which registers survive calls: assume only si, di (and bp/sp). This is the safe assumption consistent with ax,bx,cx,dx clobbered.
+
+Design with si, di across calls, everything else in memory/stack.
+
+We need loop indices i, j counters and base pointers. We can dedicate our own stack frame: push original SI/DI? We're in inline asm within a function; we clobber si/di — list them in clobbers? Since we tell GCC clobbers ax,bx,cx,dx,si,di,memory,cc, GCC saves around asm. Good. So we can freely use si, di; they're preserved across calls per ABI (callee-saved).
+
+Loop 1:
+
+x1_ptr (csi:%di) = x1 + 8*i (points to x1[i])
+A_row? We need pA = A + 8*(i*n + j); and pY = y1 + 8*j.
+
+Per inner iteration:
+- push pY words, pA words -> call __muldf3(a = A[i][j], b = y1[j]).
+  signature double __muldf3(double a, double b); args: a first. Push b then a.
+- Result (assume AX,DX,CX,BX words 0..3). Push result to temp stack space, then push x1[i] words? For __adddf3(a,b): a=x1[i], b=product. Push b then a. Easier: keep result in regs, push them (push bx,cx,dx,ax order? For b argument: push ms first: push bx (w3), push cx (w2), push dx (w1), push ax (w0)) — wait we are pushing b = product; b occupies w0=ax,w1=dx,w2=cx,w3=bx. Push order to get w0 at lowest address: push w3, w2, w1, w0 → push bx, cx, dx, ax. Then push a = x1[i] from (di): pushw 6(di), 4(di), 2(di), (di). call __adddf3. Result again in ax,dx,cx,bx. Store to (di): movw ax,(di); movw dx,2(di); movw cx,4(di); movw bx,6(di). Then add sp, 16.
+
+But wait: after `call __muldf3`, caller must clean stacked args: addw $16 to sp... sp adjustment with immediate is 8086-ok? `add sp, imm16` yes. `addw $16, %sp` fine.
+
+Between the two calls, product held in ax,dx,cx,bx (clobbered by nothing between). Good.
+
+Counters: inner counter j must survive calls → must be in si or di. But di holds pX (x1[i]); si can hold j? We also need pA and pY progression. pA and pY can be reconstructed from i, j and base pointers... that requires more regs. Alternative: keep pA in si, advance by 8 each iter; keep j counter on our stack memory; pY likewise on stack? Loads: we need pY value to push args: we can load from our stack slot into, say, ax and move to a spare reg... but pushing memory operands: `pushw 6(%bx)` style requires pointer in bx; bx clobbered by calls, but between calls we can reconstruct pointers from bases+indices kept in si/di and stack slots.
+
+Simplest robust approach: allocate local stack slots via sub sp, K at asm start (and restore at end). Slots:
+
+- slot_i (2 bytes)
+- slot_pY (2) — pointer to y[j]
+- slot_pA (2) — pointer to A[i][j]
+- (slot_pX2 etc for second loop; reuse)
+
+But hold on: mov memory-to-memory not allowed; but push mem allowed on 8086 (push r/m16 is FF /6 — indeed opcode FF /6 is PUSH r/m16, available since 8086? Let me verify: PUSH r/m16 — opcode FF /6 — yes, 8086 supports push r/m16 (e.g., push word ptr [bx]). Yes, on the 8086, PUSH and POP of memory operands are supported. Good.
+
+Also `push imm` not on 8086 (that's 286) — avoid.
+`pusha/popa` not on 8086 — avoid.
+`imul` reg,imm — 286; avoid (we can use shifts/adds).
+`movzx` — 386; avoid.
+Shifts by cl only? On 8086, shift by imm only 1: `shl ax,1` ok; `sal ax, imm8` is 286. So multiply by 8 via three `shlw $1`? Wait `shl ax, 1` uses opcode D0 /4 (shift by 1) — valid 8086. `shl ax, cl` D2 — valid. `shl ax, imm8` C1 — 286. Our previous code used `addw %%ax,%%ax` to double — safe. Keep that pattern.
+
+Also note: jg/jle etc with short jumps automatic in gas. `%=` gives unique number.
+
+Also `lods/stos` available but not needed.
+
+Now does gas for ia16 accept `pushw 6(%bx)`? Addressing mode (%bx) valid. Using (%si), (%di) fine. (%bp) uses SS — fine for stack slots: e.g., `-2(%bp)`.
+
+Now decision: allocate stack slots via `subw $K, %sp` and use sp-relative addressing: `(%sp)`, `2(%sp)` — valid addressing? (%sp) alone is NOT a valid 8086 addressing mode! 8086 modes: [bx+si], [bx+di], [bp+si], [bp+di], [si], [di], [bp]+disp16 (or [bx]+disp16). plain [sp] invalid; [bp] needs disp8 at least (encoded as [bp]+disp8=0). So stack slots must be addressed via bp. But bp is the frame pointer used by GCC (function has frame). In inline asm we shouldn't clobber bp without declaring. We could avoid using sp/bp-addressed slots by using C memory variables as operands: "m" constraint failed because of inlining... For locals? We can't create new locals in asm block (it's one asm statement). We could create named operands referencing function-scope... no.
+
+Option: Use bp but save/restore it within the asm, and add "bp" to clobber list? GCC ia16 may complain "bp cannot be clobbered"? Generally GCC allows bp clobber (frame pointer eliminated or not—if frame pointer needed, clobbering bp in asm is an error "unknown register" or it just lets it? For x86, clobbering ebp is allowed in GCC 5+). Risky.
+
+Better: push bp; create our own frame? We still need bp to address slots, conflicting with caller's bp. We can push bp, set bp? Wait we need our own base pointer for slots: push bp; mov sp, bp; sub sp, K; ... ; mov bp, sp? At end: mov sp, bp? We saved caller's bp on stack; restore with pop bp after cleaning? Let's do: `push bp; movw %sp,%bp; subw $K,%sp;` at end `movw %bp,%sp; popw %bp;` Actually if we set bp=sp after pushing bp, then slots at -2(bp), -4(bp), etc. At end, `movw %bp,%sp; popw %bp`? That moves sp to just after pushed bp location? push bp decremented sp by 2; bp points to saved bp (sp after push). slots are below (more negative). `movw %bp,%sp` resets sp to point at saved bp; `popw %bp` restores. 
+
+But wait — during calls we push args; that's below our slots; fine. We restore sp via bp frame - no leak.
+
+Can we clobber bp in inline asm? If we add "bp" to clobber list: GCC x86 historically disallowed ebp clobber with frame pointer; GCC >=4.7 allows with -fomit-frame-pointer? Hmm. Alternatively don't list bp in clobbers (inline asm is allowed to use callee-saved regs without clobber listing? Technically writing to any register not listed is undefined except... no—asm may not modify fixed/caller-visible regs secretly; callee-saved regs may be used if saved/restored; GCC recommends listing them). Many real-world asms save/restore callee regs without clobber listing. Since we save/restore bp (and si/di—though we'll clobber si/di and list them), it's acceptable to GCC? GCC docs: you may not use registers not listed as clobbered/outputs... Actually the compiler assumes all registers not mentioned are unchanged. bp will be unchanged from GCC's perspective because we restore it. That is fine as long as GCC doesn't use bp across our asm for keeping track of stack — it does use bp as frame pointer but we restore it before asm ends, so no observable change. However listing "bp" in clobbers could cause a hard error; not listing but modifying transiently is okay? There's subtlety with "memory" clobber etc. Since we restore bp exactly, and between our modification and restore GCC's generated code doesn't run (it's inside one asm template), it's safe. GCC may, however, itself refer to locals via bp immediately before/after asm — no issue.
+
+Similarly si/di: we can push/pop them and not list as clobbers... but currently previous attempt listed si/di as clobbers and compiled (errors were only about fpu/immediate). Keep them as clobbers so GCC knows; then no need to save/restore si/di for GCC. But calls to libgcc also preserve si/di per ABI, so our use is safe across calls.
+
+But we still need a stack frame for slots. We need space for: inner counter (j) maybe we can keep in si; pointers pA, pY maybe advance on stack? Let's count needed persistent-across-call values in loop1 inner iteration:
+
+Persistent across the two libcalls within one iteration: pX (x1[i] ptr) — keep in di (safe). pA and pY — needed to push args for __muldf3 (before first call) and to advance after; pA/pY not needed after __muldf3 result obtained except advancing: advance can happen before calls: e.g., at loop start compute pointers, push args, then advance stored pointers (but stored where?). If we advance before the calls, we need pA/pY stored in stack slots (since si needed elsewhere? si free!). We have si free (di=pX). Keep pA in si (safe across calls). Keep pY ... nowhere. We have only si,di safe. j counter also needs safety. Options: store j counter on stack slot; store pY on stack slot; or store both pointer and counter as one: pY = y1 + 8j. We could derive pY from j each iteration: needs multiply by 8 computation with scratch regs (ax ok, since before call we can compute... but needed after call for arg pushing? We need pY only for pushing b arg into __muldf3, which happens before the first call; after that we don't need pY again until next iteration. If j is on stack, at iteration start: load j counter into bx (scratch), compute pY = y1_base + j*8 into bx... but y1_base also needs to live somewhere (stack slot or operand). y1 base pointer changes never; we can keep y1 base in a stack slot set each outer iteration? It persists whole loop1. We have stack slots, fine.
+
+Alternatively structure code so pY lives in si and pA derived: pA advances by 8 each inner iteration too; both advance by 8. We can't keep both in regs... but pA = A_row + pYoffset? Since both increment by 8 from iteration start pointers (A_row+i...): pA = pA0 + k, pY = pY0 + k, same k = 8j. So store k in si (safe); pA0, pY0 in stack slots; per iteration compute pA = pA0+si in bx, pY = pY0+si in... need both to push args sequentially: push b=y[j]: use bx=pY, push words. Then compute pA in bx, push words for a? Wait __muldf3(a,b): push b first then a. We can compute pY -> push 4 words; recompute pA -> push 4 words; call; add sp,16. Result in ax,dx,cx,bx assumed. b for add = product: push bx,cx,dx,ax. a = x1[i] via di: push 6(di),4(di),2(di),(di). call __adddf3; add sp,16. store result via di: movw ax,(di); dx,2(di); cx,4(di); bx,6(di). advance si +=8. compare si with limit (8*n) in stack slot or keep limit somewhere. j loop condition: j from 0..n-1 → k from 0..8(n-1): compare si to 8n. Keep 8n in stack slot LIM1. Compute via mov n to ax, add ax,ax x3, store.
+
+Also we need i row step: pA0 = A + 8*i*n stored per outer iteration: after inner loop, new pA0 = old + 8n (add LIM... pA0 advances by row size n*8 = same as LIM slot). Also pX (di) advances by 8. pY0 constant (= y1 base) slot.
+
+Outer loop counter i: keep count n in a slot or use pX end-limit: pX runs from x1 to x1+8n: limit slot LIM1 reused: compare di < x1+8n. Store slot X1END = x1+8n (same value as A0+? different). LIM1 = 8n; X1END = x1 + 8n.
+
+Loop 2: x2[i] += A[j][i]*y2[j]. Column access: pA advances by row stride 8n across j. pX2 = di (x2+i). Let k8 = si = 8j again; pA = A + 8*i + (8n)*j. We can keep pA column pointer on stack, advance by LIM (=8n) each inner iter; pY2 on stack advance by 8; or unify: store two pointers in slots, both advance differently. We have stack slots; fine. Alternatively compute per iteration using si: pY = y2 + si; pA = A_col_start + (8n)*j — multiplication by j each time expensive; better keep pA in slot advanced by 8n.
+
+Stack slot plan (offsets relative to our bp; slots stored below saved bp):
+- S_pA: 2 bytes (current A element pointer) [loop1 col-loop; loop2 column-loop]
+- S_pY: 2 bytes (current y pointer)
+- S_LIM: 2 bytes (8*n)
+- S_XEND: 2 bytes (x end pointer)
+- maybe S_TMP counter not needed.
+
+We need base pointers y1/y2/A/x1/x2 to initialize slot values; these come from input operands loaded into scratch regs at start.
+
+Initialization:
+Load n into ax; compute 8n by three doublings → store S_LIM.
+x1end = x1 + 8n → S_XEND (loop1); but loop2 needs x2end = x2+8n: compute later or store second slot S_X2END. Eh, store S_XEND per loop before starting each loop. Use same slot recomputed.
+
+di = x1 (pX); S_pA = A; S_pY = y1.
+
+Outer loop1 condition: cmp di, S_XEND; jae done. Inner: si = 0; cmp si, S_LIM; jae inner_done.
+
+Wait n could be 0 → S_LIM=0 → loops skipped via initial comparisons. Also outer: if x1+0 == x1 → skip. Good with jae (unsigned). Using unsigned comparisons for pointers fine.
+
+Now the calls: note __muldf3 name for ia16 might use different naming? Standard soft-fp double add: `__adddf3`, multiply `__muldf3`. Yes.
+
+But zero FPU: GCC uses soft-fp only if -msoft-float (default for 8086? ia16-elf-gcc default may be soft-float since 8086 lacked FPU; but the assembler previously rejected fld because target CPU i8086 has no FPU instructions—implying compile used -march=i8086 and libgcc is soft-fp). Good.
+
+Return convention: need certainty. Let me try to recall actual generated code for ia16-elf-gcc returning long long:
+
+I recall an example from gcc-ia16 testsuite or README: `long long foo(void) { return 0x1122334455667788LL; }` generates `movw $0x7788,%ax; movw $0x5566,%dx; movw $0x3344,%cx; movw $0x1122,%bx; ret`. Yes! I'm fairly confident I've seen this: returns in ax, dx, cx, bx. And that's why bx is call-clobbered in this ABI. Great—assumption validated by memory (order: low word in ax, then dx, cx, high word in bx).
+
+And call-clobbered: ax, bx, cx, dx; callee-saved: si, di, bp. Good.
+
+Now, another subtlety: our asm listed clobbers includes bx — fine.
+
+Potential issue: GCC's register allocator uses si/di for values across our asm? We declared si/di clobbered; fine.
+
+Also `cc` clobber from cmp/dec.
+
+Now the label uniqueness with %= — good since inlined multiple times? only once. Fine.
+
+Instruction syntax in AT&T for ia16 gas: movw, addw, pushw, cmpw, jae, call (direct). Use %% regs. Memory addressing: 6(%%si) etc. pushw 6(%bx) allowed? Addressing with bx ok.
+
+Edge: `pushw %[something]`? No—we use registers.
+
+Careful: when computing row start for loop1: S_pA starts at A base, and after each i (outer iteration) add S_LIM (8n) to S_pA. Inner uses pA = S_pA + si but si counts k=8j; pA advances by 8 each j — consistent since pA0 advances row per i. pY = S_pY + si where S_pY = y1 base (loop1). pY never advances across outer (same base). Good.
+
+Loop2: S_pA = A + 8*i (column start) per outer i; S_pY = y2 base; inner: pA advanced per j by S_LIM (8n row stride) — but pA needed to push a-arg each iteration and must persist across the two calls; can't keep in reg; so instead keep column element pointer in S_pA COL and update in slot each iteration? We need pA during arg pushing only (before first call); after calls we can update the slot: add S_LIM to slot. pY likewise from S_pY2 + si? Use si = 8j; pY = y2base + si. pA = slot S_pA (load into bx directly). After calls: addw S_LIM to S_pA? memory add with reg: movw S_LIM(%bp),%ax; addw %ax, S_pA(%bp). Also advance si += 8 and di += 8 (done after inner complete). Wait di advance after inner loop completes.
+
+We can use the same slot S_pA for both loops.
+
+Loop1 inner iteration detailed:
+
+```
+; bx = pY = S_pY + si
+movw S_pY(%bp), %bx
+addw %si, %bx
+pushw 6(%bx)
+pushw 4(%bx)
+pushw 2(%bx)
+pushw (%bx)
+; bx = pA = S_pA + si
+movw S_pA(%bp), %bx
+addw %si, %bx
+pushw 6(%bx)
+pushw 4(%bx)
+pushw 2(%bx)
+pushw (%bx)
+call __muldf3
+addw $16, %sp
+; result product in ax,dx,cx,bx (w0..w3)
+; push b=product (w3..w0): bx,cx,dx,ax
+pushw %bx
+pushw %cx
+pushw %dx
+pushw %ax
+; push a=x1[i] from di
+pushw 6(%di)
+pushw 4(%di)
+pushw 2(%di)
+pushw (%di)
+call __adddf3
+addw $16, %sp
+; store result to (di)
+movw %ax, (%di)
+movw %dx, 2(%di)
+movw %cx, 4(%di)
+movw %bx, 6(%di)
+addw $8, %si
+cmpw S_LIM(%bp), %si
+jb inner
+```
+
+Note: flags from cmpw S_LIM(%bp),%si — mem, reg compare allowed. jb (unsigned below) valid 8086.
+
+Add sp,16: `addw $16, %%sp`. Note: pushing args uses sub of sp implicitly; our bp frame unaffected.
+
+One concern: `call __muldf3` from within asm — symbol resolution by linker fine. But GCC may compile with function renaming/leading underscore? ELF target: no underscore prefix. ia16-elf-gcc ELF: symbols as-is. Good.
+
+Another concern: If the program is compiled with hard-float?? Then __adddf3 still exists in libgcc anyway (it might use FPU internally)? If compiled -m80387 on later CPU, libgcc variants... but the assembler rejected fld, so arch is i8086 → soft. Fine.
+
+Also might the libgcc soft-fp double functions be namespaced `__muldf3` — yes.
+
+Now initialization code:
+
+```
+movw %[n], %ax
+addw %ax, %ax
+addw %ax, %ax
+addw %ax, %ax    ; ax = 8n
+movw %ax, S_LIM(%bp)
+; ---- loop 1 ----
+movw %[x1], %di
+movw %[A], %bx
+movw %bx, S_pA(%bp)
+movw %[y1], %bx
+movw %bx, S_pY(%bp)
+; outer limit
+movw %di, %bx
+addw %ax, %bx     ; x1 + 8n
+movw %bx, S_XEND(%bp)
+```
+
+Outer loop 1:
+
+```
+L1_outer:
+cmpw S_XEND(%bp), %di
+jae L1_done
+xorw %si, %si    ; xor allowed 8086, sets si=0
+L1_inner:
+cmpw S_LIM(%bp), %si
+jae L1_inner_done
+... body ...
+addw $8, %si
+jmp L1_inner? or cmp at top
+L1_inner_done:
+; advance di +=8 ; S_pA += S_LIM
+addw $8, %di
+movw S_LIM(%bp), %ax
+addw %ax, S_pA(%bp)
+jmp L1_outer
+L1_done:
+```
+
+If n==0: S_XEND == di initially → jae taken (equal) → skip. Good.
+
+Loop 2:
+
+```
+movw %[x2], %di
+movw %di, %bx
+addw S_LIM(%bp), %bx
+movw %bx, S_XEND(%bp)
+; per-outer column start: pA = A + 8*i ; maintain our own: start A, advance by 8 each outer iteration
+movw %[A], %bx
+movw %bx, S_pA(%bp)   ; column start ptr; +8 per outer i
+```
+
+Inner: si=0 (8j), pY = y2 + ... need y2 base in slot S_pY (set once):
+
+```
+movw %[y2], %bx
+movw %bx, S_pY(%bp)
+```
+
+Inner iteration loop2:
+
+```
+; push b = y2[j] = S_pY + si
+movw S_pY(%bp), %bx
+addw %si, %bx
+pushw 6..0(%bx)
+; push a = A[j][i] = S_pA  (the column element pointer)
+movw S_pA(%bp), %bx
+pushw 6..0(%bx)
+call __muldf3
+addw $16,%sp
+pushw %bx / %cx / %dx / %ax
+pushw 6(%di) ... (%di)
+call __adddf3
+addw $16,%sp
+store → di
+; advance S_pA += S_LIM ; si += 8
+movw S_LIM(%bp), %ax
+addw %ax, S_pA(%bp)   ; wait—must happen per inner iteration
+addw $8, %si
+cmp/jmp
+```
+
+But careful: after calls, ax used for store... store first, then limit add. Store uses ax,dx,cx,bx — do store, then load S_LIM into ax, add to slot.
+
+Outer2 advance: di += 8; column start advances by 8: but S_pA is being advanced by LIM inner iterations... By inner end, S_pA = col_start + n*(8n) = col_start + full column = col_start + 8n^2. For next i (i+1), col start should be old+8. Rather than restore from advanced value (old+8n^2+8??), maintain separate slot S_COL: colbase = A + 8i, and at inner start set S_pA = S_COL. Or compute: after inner done, S_pA currently = colstart + n*LIM. Next colstart = colstart+8 = S_pA - n*LIM + 8 = S_pA - (colsize) + 8 where colsize = n*LIM... requires another slot. Easier: second slot S_COL storing column base; each outer iteration: mov S_COL→S_pA at... inner uses S_pA directly; we can just set at outer iteration start: movw S_COL(%bp),%ax; movw %ax,S_pA(%bp); and after inner loop, addw $8 to S_COL. 
+
+Now slot inventory (each 2 bytes):
+S_LIM (8n), S_XEND, S_pA, S_pY, S_COL. That's 10 bytes. Allocate 12 for safety/alignment: subw $12, %sp. Offsets: -2(%bp), -4, -6, -8, -10. Use %bp-based since our frame.
+
+Wait: our frame setup: pushw %bp; movw %sp,%bp; subw $12,%sp. Slots at -2...-10(%bp). At end: movw %bp,%sp; popw %bp. But careful: at asm end, must ensure args pushed are all cleaned (we add sp,16 each call). Balanced. Good.
+
+Using (%bp) addressing: -2(%bp) valid (disp8). Fine.
+
+But: does gas accept `movw %%sp, %%bp` etc. yes.
+
+Interrupt concerns none.
+
+Important: Since we modify %bp inside asm without listing it in clobbers... GCC documentation says you should list; but listing bp for x86 historically gives error "cannot be used in 'asm' here" only for fixed regs (sp? bp not fixed when -fomit-frame-pointer? default ia16 maybe has frame pointer). Safer to save/restore bp and NOT list it. Since our asm is volatile and self-contained, GCC assumes bp unchanged → it is unchanged by end. The generated code inside asm region is ours; GCC won't insert anything. Safe.
+
+However—one caveat: GCC may use "%bp" as an operand register for our "r" inputs! The operand %[n] etc. are consumed only at our explicit movs; but GCC could allocate an "r" input to bp. If we then trash bp (even saving/restoring), the input value in bp would have been read by us before? We must read all inputs BEFORE modifying bp... but our frame setup (push bp) happens before input reads? We can read inputs first into memory slots? Inputs read into regs then spilled to slots after frame set. Order: at asm start, inputs live in GCC-chosen regs. Step 1: don't touch bp yet. We need at least: n, x1, x2, y1, y2, A. We can stash them—where? We have no slots yet (need bp frame). Could push them onto stack immediately (push %[reg]) — pushing input reg operands: `pushw %[n]` is allowed syntax? If operand allocated to a register, `pushw %[n]` emits push reg — fine. Push all six (12 bytes). Then setup frame: push bp; mov sp,bp; sub $12,sp. Then pop... wait inputs are below frame base now; we need to load them. Address them via bp positive offsets: after `push bp`, bp points to saved bp; the six pushed words are at 2(%bp),4(%bp),...,12(%bp) (in reverse push order). After we sub $12 for slots, args region remains above bp. At the very end we must clean those 12 pushed input bytes too: our `movw %bp,%sp` discards slots AND the pushed inputs? No: mov bp,sp resets sp to bp (pointing at saved old bp), discarding everything below (slots) but the pushed inputs are above bp (2(bp)...12(bp)) — not discarded. Damn. So instead push inputs AFTER frame sub? i.e.:
+
+push bp; mov sp,bp; sub sp,$S (slots 12 + input save 12 = 24). Then store input regs into negative-offset slots via movw. But then inputs could be in bp — already saved? If GCC allocated an input to bp... push bp happens first, so input value in bp is beneath; reading 2(%bp)? But is bp used for inputs in practice? For "r" constraints of 16-bit values, GCC picks from ax,bx,cx,dx,si,di (bp typically not used unless -fomit-frame-pointer and reg pressure high; with many inputs (6) + it might pick bp!). To be safe, read all input operands into stack slots BEFORE modifying bp? That requires addressing stack without bp — but (%sp) invalid mode. Could push each input: `pushw %[n]` etc. — if operand is in bp? push bp works but pushes the input value; fine. Pushing is safe regardless of which reg. So:
+
+pushw %[A]
+pushw %[y2]
+pushw %[y1]
+pushw %[x2]
+pushw %[x1]
+pushw %[n]
+
+Then setup frame:
+pushw %bp
+movw %sp, %bp
+subw $10, %sp   ; slots for LIM, XEND, pA, pY, COL (5 words)
+
+Now inputs at: after pushing bp at top: 2(%bp) = n (last pushed), 4(%bp)=x1, 6(%bp)=x2, 8(%bp)=y1, 10(%bp)=y2, 12(%bp)=A.
+
+Slots at -2(%bp)=LIM, -4(%bp)=XEND, -6(%bp)=pA, -8(%bp)=pY, -10(%bp)=COL.
+
+Cleanup at end: movw %bp,%sp; popw %bp; addw $12,%sp. That pops saved bp then removes the 6 pushed input words. Balanced with initial 6 pushes.
+
+This avoids reading input regs after clobber: all inputs consumed by the initial six pushw—if any input was in a reg we later clobber (ax,bx,cx,dx,si,di), no problem because consumed first. If compiler allocated input in bp? Pushing bp value—correct value (caller's bp is input?? no, input wouldn't be in bp if it represents caller's frame pointer... if input allocated to bp it means compiler already used bp for value; push bp pushes that value; then we save bp (same reg) on stack; then mov sp,bp. Fine.)
+
+But wait: we don't list bp as clobber yet we overwrite it via movw %sp,%bp. From GCC's perspective bp unchanged at end (we restore via popw %bp? After movw %bp,%sp, sp points at saved-bp word; popw %bp restores original value. ✔). So fine.
+
+Also note: if compiled WITHOUT frame pointer (-fomit-frame-pointer), our bp save/restore still fine.
+
+Now inputs are on stack at positive bp offsets — direct addressing fine.
+
+Alternatively simpler: skip pushing inputs; directly reference them via movw %[n],%ax before touching bp... but subsequent code clobbers ax... we'd read them one-by-one as needed—but input regs might be regs we clobber early. E.g., %[x2] might be in ax; if we trash ax before reading %[x2], wrong. Unless GCC allocates distinct regs for distinct inputs—yes, distinct inputs get distinct registers (no overlap for inputs read at start... actually inputs may share regs with each other? GCC may assign same register to two input operands if it thinks they're both consumed at start?? Inputs are all live at asm start; allocator can overlap inputs only if their values are equal? No—inputs may be in same reg only if they have same value, generally allocator won't put two live inputs in same reg unless tied). With 6 HImode inputs and available regs ax,bx,cx,dx,si,di = exactly 6! It might use all six, leaving none, or some in memory? If more inputs than regs, some become memory... risky. The push-all-first approach is safest: every input is consumed at the very first instruction sequence before any clobber, regardless of allocation (reg or memory; pushw works for memory too: pushw mem ok!). 
+
+Edge: If an input is allocated to sp? Never. Good.
+
+Now write slot accesses.
+
+Constants: S_LIM = -2, S_XEND = -4, S_pA = -6, S_pY = -8, S_COL = -10.
+
+Compute: 
+
+```
+pushw %[A]
+pushw %[y2]
+pushw %[y1]
+pushw %[x2]
+pushw %[x1]
+pushw %[n]
+pushw %bp
+movw %sp, %bp
+subw $10, %sp
+movw 2(%bp), %ax      ; n
+addw %ax, %ax
+addw %ax, %ax
+addw %ax, %ax          ; 8n
+movw %ax, -2(%bp)      ; LIM
+; loop1 setup
+movw 4(%bp), %di       ; x1 ptr
+movw %di, %bx
+addw -2(%bp), %bx      ; Hmm addw mem, reg: addw -2(%bp), %bx valid (mem,reg)
+movw %bx, -4(%bp)      ; XEND = x1+8n
+movw 12(%bp), %bx      ; A
+movw %bx, -6(%bp)      ; pA
+movw 8(%bp), %bx       ; y1
+movw %bx, -8(%bp)      ; pY base
+```
+
+Outer1:
+
+```
+.Lmvto1%=:
+cmpw -4(%bp), %di
+jae .Lmvtl1d%=
+xorw %si, %si
+.Lmvti1%=:
+cmpw -2(%bp), %si
+jae .Lmvti1d%=
+movw -8(%bp), %bx
+addw %si, %bx
+pushw 6(%bx)
+pushw 4(%bx)
+pushw 2(%bx)
+pushw (%bx)
+movw -6(%bp), %bx
+addw %si, %bx
+pushw 6(%bx)
+pushw 4(%bx)
+pushw 2(%bx)
+pushw (%bx)
+call __muldf3
+addw $16, %sp
+pushw %bx
+pushw %cx
+pushw %dx
+pushw %ax
+pushw 6(%di)
+pushw 4(%di)
+pushw 2(%di)
+pushw (%di)
+call __adddf3
+addw $16, %sp
+movw %ax, (%di)
+movw %dx, 2(%di)
+movw %cx, 4(%di)
+movw %bx, 6(%di)
+addw $8, %si
+jmp .Lmvti1%=
+.Lmvti1d%=:
+addw $8, %di
+movw -2(%bp), %ax
+addw %ax, -6(%bp)
+jmp .Lmvto1%=
+.Lmvtl1d%=:
+```
+
+Loop2 setup:
+
+```
+movw 6(%bp), %di       ; x2
+movw %di, %bx
+addw -2(%bp), %bx
+movw %bx, -4(%bp)      ; XEND
+movw 12(%bp), %bx      ; A
+movw %bx, -10(%bp)     ; COL
+movw %bx, -6(%bp)      ; pA = COL for i=0
+movw 10(%bp), %bx      ; y2
+movw %bx, -8(%bp)      ; pY
+```
+
+Outer2:
+
+```
+.Lmvto2%=:
+cmpw -4(%bp), %di
+jae .Lmvtl2d%=
+xorw %si, %si
+.Lmvti2%=:
+cmpw -2(%bp), %si
+jae .Lmvti2d%=
+movw -8(%bp), %bx
+addw %si, %bx
+pushw 6(%bx)
+pushw 4(%bx)
+pushw 2(%bx)
+pushw (%bx)
+movw -6(%bp), %bx      ; pA (column element)
+pushw 6(%bx)
+pushw 4(%bx)
+pushw 2(%bx)
+pushw (%bx)
+call __muldf3
+addw $16, %sp
+pushw %bx
+pushw %cx
+pushw %dx
+pushw %ax
+pushw 6(%di)
+pushw 4(%di)
+pushw 2(%di)
+pushw (%di)
+call __adddf3
+addw $16, %sp
+movw %ax, (%di)
+movw %dx, 2(%di)
+movw %cx, 4(%di)
+movw %bx, 6(%di)
+movw -2(%bp), %ax
+addw %ax, -6(%bp)      ; pA += 8n
+addw $8, %si
+jmp .Lmvti2%=
+.Lmvti2d%=:
+addw $8, %di           ; next x2[i]
+movw -10(%bp), %ax
+addw $8, %ax
+movw %ax, -10(%bp)     ; COL += 8
+movw %ax, -6(%bp)      ; pA = COL
+jmp .Lmvto2%=
+.Lmvtl2d%=:
+```
+
+Cleanup:
+
+```
+movw %bp, %sp
+popw %bp
+addw $12, %sp
+```
+
+Double-check pushes count for args: __muldf3(a,b): push b (4 words) then a (4 words). We push y[j] (b) first: sequence pushw 6,4,2,0 creates stack: top (lowest addr) = word0 (least significant). When GCC passes a double on stack, the 8-byte region [arg] has least significant word at lowest address. After we push 8 pushes total, sp points at a's word0. Above it a's words..., then b's words. Callee sees arg1=a at 2(bp) (after its push bp), arg2=b at 10(bp). ✔ (4(%bp),6,8 for a high words; 10,12,14,16 for b.) ✔ b = y[j] — __muldf3(A[i][j], y[j]) = a*b. First arg a = A[i][j] pushed last (closest to sp). In my code above I pushed y first then A. That means first-pushed (deeper) = y = second arg b; last-pushed (on top) = A = first arg a. ✔ correct: callee's param a = A element, b = y element. Multiplication commutative anyway.
+
+__adddf3(a = x1[i], b = product): push b=product first (deeper), then a=x1[i]. I pushed product then x1[i] last — so a = x1[i] ✔. Addition commutative anyway. Return in ax,dx,cx,bx. ✔.
+
+But verify return reg order: I claimed low word ax, then dx, cx, bx. If instead bx were untouched and hidden-pointer convention used, everything breaks. Let me double check with stronger reasoning.
+
+ia16-elf-gcc: Based on gcc/config/ia16 by Rask. I recall its ia16.h:
+
+```
+#define FIRST_PSEUDO_REGISTER ...
+/* 1 for registers that have pervasive standard uses
+   and are not available for the register allocator.  */
+#define FIXED_REGISTERS \
+  { 0, 0, 0, 0, 0, 0, 1, 1, ...}  /* ax bx cx dx si di bp sp */
+#define CALL_USED_REGISTERS \
+  { 1, 1, 1, 1, 0, 0, 1, 1, ...}  /* ax bx cx dx used; si di saved */
+```
+
+If bx is CALL_USED (1), then bx is clobbered by calls — consistent with 64-bit return using bx. I'm fairly confident: in tkchia's toolchain, `%bx` is indeed caller-saved (this is documented as a difference vs. other x86 conventions; e.g., in libi86 and in discussions of the IA-16 ABI, the four "scratch" registers ax bx cx dx). Wait, hmm, but OpenWatcom and DOS compilers treat bx as scratch too (Watcom: ax dx bx cx scratch in its register convention). GCC ia16 default ABI: I believe yes, ax,bx,cx,dx call-clobbered; si,di call-preserved. This matches long long return ax:bx:cx:dx? Which order? Let me recall concrete disassembly:
+
+I have seen output like:
+
+```
+foo:
+    movw $34, %ax
+    movw $18, %dx
+    movw $52, %cx
+    movw $13870, %bx
+    ret
+```
+
+for returning 0x12345678? I can't fully verify, but the common description: "On IA-16, GCC returns 32-bit values in %dx:%ax (not %ax:%dx), and 64-bit values in %bx:%cx:%dx:%ax (most significant word first in listing)". Low word in %ax for 32-bit dx:ax means ax=low, dx=high ✔ (x86 standard). For 64-bit: presumably ax=w0, dx=w1, cx=w2, bx=w3 (extending the pattern). Our store: movw ax,(di); dx,2(di); cx,4(di); bx,6(di) — matches little-endian w0..w3 ✔.
+
+Risk remains, but this is the best-known ABI. Also, GCC's libgcc __muldf3 compiled for the same ABI returns consistently, so as long as our reading matches GCC's return convention, correct.
+
+Additionally, maybe there are specialized assembly libcalls in libgcc for ia16 (e.g., libgcc/config/ia16/lib1funcs.S?) which could use a custom internal convention (e.g., __muldf3 in assembly). If libgcc's soft-fp is compiled C via dbit/lbit — obey same ABI. Either way consistent.
+
+Now, one more check: our asm clobbers "si","di" (listed), "ax","bx","cx","dx", "memory", "cc". bp is saved/restored; we don't list it (must be careful GCC doesn't allocate an "r" input to bp—we consumed inputs via pushw first, which is safe even if an operand is in bp? Wait—pushw %[x] where compiler put operand in bp: this pushes current bp (the input value), correct. Then we push bp (same value! because bp still holds input). Then mov sp,bp. Then we read 12(%bp) etc. for inputs — fine, they're on stack. And we restore bp at end via pop. During the body we never read bp-dependent input directly. ✔ Even weirder allocations (operand = sp) impossible.
+
+But: what if compiler passes an input in memory (stack) rather than reg — "r" constraint forces reg; if out of regs it errors? We have 6 inputs + the template uses no operand regs later (we hardcode regs). 6 HImode inputs need 6 registers simultaneously only at the push instructions... Actually once we push an input, GCC still considers the operand value as needing a register for the whole asm? Input operand registers are allocated for the duration of the asm statement conceptually, but they only need to be read; GCC allocates a register per input operand (live through entire asm notionally). With 6 inputs, it needs 6 distinct registers: ax,bx,cx,dx,si,di — exactly 6 available (bp excluded as it's reserved/fixed in default frame-pointer mode; sp fixed). Feasible ✔. If not feasible, compile error "unable to find a register"; risk if bp also used (with -fomit-frame-pointer, bp becomes allocatable → 7 regs, fine; without, exactly 6). OK.
+
+Alternatively reduce simultaneous inputs by using one operand struct pointed? Can't.
+
+We could reduce risk by making constraints "g"? "g" allows memory/immediate/reg — but then `pushw %[n]` with immediate fails on 8086 (no push imm!). Since n may be a constant after inlining (n = N macro: static function inlined → n is constant  e.g., 130 or 40). With "r", GCC loads constant into a reg — pushw reg fine. With memory possible, pushw mem fine. "g" might give immediate → invalid. So keep "r". If register shortage occurs, compile error — accept risk. Actually to be safer, we could split: read n separately earlier? All six are consumed at start regardless. 6 regs is exactly available; GCC reload can handle. 
+
+Hmm, but note: register operands live "through" the asm; our clobbers ax,bx,cx,dx,si,di overlap with them—clobbering an input register is allowed (early-clobber semantics automatically since we don't use % operands after). Fine, inputs+clobbers overlap allowed (GCC treats input regs as dead after asm if clobbered... overlapping input & clobber is permitted; the input value is read from the reg at asm start—our first push does that). ✔.
+
+Now, the call to __muldf3 and __adddf3: also might clobber the x87/emulation state—fine. "memory" clobber ensures GCC doesn't cache x1 values in regs across asm ✔.
+
+Potential issue: libgcc functions could be `far`? Small memory model near calls ✔ (call direct = near). ia16-elf-gcc default tiny/small model → near ✔.
+
+Alignment of double pushes: none needed.
+
+One more subtlety: __muldf3/__adddf3 may internally use si/di? They must preserve per ABI ✔.
+
+Another: interrupts using stack below sp—non-issue in hosted env.
+
+Also make sure we don't use `%bp`-relative before frame set? We set frame right after pushes ✔. And subw $10, %sp ✔ (immed ok).
+
+`xorw %si, %si` — 8086 ✔.
+
+`cmpw -2(%bp), %si` — gas syntax mem first operand vs reg: AT&T: cmpw src,dst = compare dst-src; `cmpw -2(%%bp), %%si` compares si - mem, sets flags as si vs LIM. We want jae if si >= LIM → unsigned ✔.
+
+For pointers: cmpw -4(%bp), %di; jae → di >= XEND → done ✔. Unsigned pointer compare fine (no wraparound in practice).
+
+`addw -2(%bp), %bx` → bx += mem ✔ (src mem, dst reg for addw: add src to dst; AT&T addw mem, reg → reg += mem ✔).
+
+`addw %ax, -6(%bp)` → mem += ax ✔.
+
+Store results: movw %ax, (%di) etc ✔ addressing (%di) ✔.
+
+Reading x1[i] via pushw 6(%di) ✔.
+
+Compute XEND: movw 4(%bp), %di then addw -2(%bp),%di? We computed with bx: fine.
+
+Also for loop1 pA advances per outer by LIM: S_pA += LIM: movw -2(%bp),%ax; addw %ax,-6(%bp) ✔ (this uses ax after inner store... in loop1, inner-end code: addw $8,%di then movw -2(%bp),%ax; addw %ax,-6(%bp): ax was result w0, already stored ✔).
+
+In loop2 inner-end: we must store to di BEFORE using ax for LIM ✔ (ordering in code above: store, then movw -2(%bp),%ax ...). In my drafted loop2 I placed store then add — ✔ but in loop1 body the advance `addw $8,%si; jmp` — si safe ✔.
+
+Wait loop1 body after calls: store; addw $8,%si; jmp inner-top. ✔ No LIM slot change needed (pA recompute each iteration from S_pA + si ✔).
+
+Loop1 usage of S_pA: per-iteration pA = S_pA + si where S_pA = row start. Row start update at outer end ✔.
+
+Loop2 S_pA is FULL column element pointer mutated per inner iteration ✔; recall we set pA=COL at outer setup (i=0) and after each outer iteration (COL+=8 → pA) ✔. But note: at outer2 end, we do `addw $8,%di` BEFORE computing COL/pA? Order irrelevant.
+
+Also loop2 needs S_XEND computed from x2 ✔.
+
+Check S_pY for loop2 = y2 base ✔ (slot -8), S_COL -10 ✔.
+
+Now, is `jae` accepted by ia16 gas? jae/jnb — ✔ 8086.
+
+Labels: use %= suffix on each label to allow multiple inlining. `%=` in template expands to unique number per asm instance ✔.
+
+Clobbers list: "ax","bx","cx","dx","si","di","memory","cc". We use bp but restore; leave out. Hmm — if compiled with -fomit-frame-pointer, GCC may place a sp-relative... our bp usage still self-contained ✔. But danger: GCC may use bp as one of the 6 input regs (if frame pointer omitted). Then pushw %[that] pushes bp's value ✔ consumed; our later push bp pushes (bp = same value) and restores it at end — final bp = input value = GCC's expected? At asm end, inputs are considered dead; bp after asm: we restored bp to its pre-asm value (which was the input value) — compiler expects bp to hold that input value? Inputs are only guaranteed live *at* asm entry; after asm, compiler reloads as needed (they're in clobbered... well bp is not in clobber list!). If GCC put an input in bp and expects it to survive the asm (because not clobbered), we restored bp to pre-asm value ✔ same value (we didn't change bp net). During asm we did change bp but restored exactly. So even if GCC reuses bp after, value intact ✔. 
+
+But subtle: we restore bp via `popw %bp` after `movw %bp,%sp`. At that point stack top = saved old bp ✔. Then addw $12,%sp removes the input pushes ✔.
+
+Everything balanced: initial pushes 12 bytes; frame 2+10; end: mov sp,bp (drops 10), pop bp (drops 2), add sp,12 (drops 12) ✔.
+
+Also mid-asm balanced around calls ✔.
+
+One more concern: the template strings with `%[n]` etc—operand names n,x1,x2,y_1,y_2,A. y_1 name contains underscore fine.
+
+Order of operands in source: define inputs list accordingly.
+
+Also the whole asm must be inside function kernel_mvt between pragmas — we output just the statement ending with `);`? Provide complete `__asm__ __volatile__ ( ... );`.
+
+Also `%bp`-addressing of pushed inputs: offsets: pushw %[A] first (deepest), then y2, y1, x2, x1, n last (shallowest), then pushw %bp. So relative to new bp: 2(%bp)=n, 4=x1, 6=x2, 8=y1, 10=y2, 12=A ✔ matches my code comments.
+
+Potential issue: `pushw %[n]` where n's reg is, say, ax — after that we clobber ax freely ✔.
+
+Also 8n overflow if n large (n up to maybe 2000 in polybench variations: 8n up to 16000 fits 16-bit for N<=8191; default mvt N=1000? polybench mvt standard N=1000? DATA_TYPE double; arrays 8*1000*1000=8MB — exceeds 8086 64KB segment! Wait small memory model 64KB data—arrays allocated via malloc polybench (far?). Hmm, on real 8086 with 64KB data, 8MB array impossible. But benchmark likely runs with smaller N (e.g., N=40 mini). The harness presumably handles that (maybe uses huge allocations via far malloc? PolyBench POLYBENCH_2D_ARRAY_DECL uses polybench_alloc_data → malloc). For ia16 small model, they'd use small N. 8n fits. i*8n? We never compute i*n explicitly—we increment S_pA by LIM each row: total A size 8*n*n must fit in 16-bit offset for pointer arithmetic if same segment... n=40: 8*1600=12800 ✔. n=100: 80000 > 65535 overflow! Pointer arithmetic wraps but allocations that big impossible anyway in 64KB. The benchmark tester must use small N. Fine.
+
+Our per-row advance uses 16-bit adds; same as C semantics on this target (16-bit pointers wrap; C would do same—pointer arithmetic on near pointers also 16-bit). Equivalent ✔.
+
+Data layout: DATA_TYPE double = 8 bytes ✔ (GCC double = 64-bit). Offsets 6 etc ✔.
+
+What if DATA_TYPE is float (if the target defines DATA_TYPE_IS_FLOAT)? Then sizes 4 — our code wrong. mvt.h default: `#else # define DATA_TYPE double` unless DATA_TYPE_IS_FLOAT/INT defined by compile flags -DDATA_TYPE_IS_FLOAT. PolyBench harness sometimes compiles with dataset variations, not datatype overrides; default double. The previous attempt used fldl/lld (8-byte) indicating assumption double accepted by designer. Keep double.
+
+Now write final template with careful escaping: the block uses `%%` for registers and `%[` `]`, `%=`—inside C string literals.
+
+Also label names can't clash: prefix .Lmvt.
+
+Make sure no `fld` etc. Also no `pushw $imm`. addw $16 ✔ imm as source operand of add is fine on 8086 ✔. `subw $10, %sp` ✔. `cmpw` with mem,reg ✔.
+
+Double-check instruction availability 8086: pushw r/m ✔, pushw reg ✔, call near direct ✔, jae ✔, jb not used (we use jae at top check + jmp). xorw ✔. All shifts replaced by addw doubling ✔.
+
+Edge n<0? n is problem size; ignore.
+
+Write it.
+
+Also note: errors from attempt0 about `mvt_asm_n` undeclared — that was a different structure; irrelevant since we reference n etc. which are in scope ✔. The "memory input not directly addressable" fixed by "r".
+
+One more: GCC might complain about 'asm' clobber "bx" while using it? No.
+
+Also, ia16 gcc may warn about `%=` requiring volatile? We have volatile ✔.
+
+Also constraint letters: use "r" — but should we permit memory fallback "rm"? If compiler runs out, memory would break push? pushw mem valid! pushw %[x] with mem operand → valid (push r/m16 ✔). And we never use operands elsewhere. So use "rm" for safety? Immediate impossible with "rm" ✔. But if operand allocated to memory (stack local), pushw word ptr [bp-x] — inside our asm template, that reference is emitted by GCC with its own addressing (e.g., -10(%bp) using the CALLER's bp!) — but we've already overwritten bp when... no: the six pushw %[..] instructions are the FIRST instructions, before we `pushw %bp; movw %sp,%bp`. So bp is still caller's frame pointer at that point ✔. Memory operands referencing caller's bp valid at that moment ✔. After that we don't use %[] ✔. So "rm" is safe for the push phase. Use "rm" to reduce reg pressure risk. But if an input is in memory addressed by bp, and we push all six first — all good.
+
+Hmm wait: what if two inputs share the same memory? irrelevant.
+
+But actually with "rm" for pointer inputs (16-bit), memory would be spilled slots—fine.
+
+I'll use "rm".
+
+Hold on—the pushes occur in a fixed textual order; if %[n] is a memory operand like `-12(%bp)` referencing caller frame, at that point bp = caller's ✔.
+
+Also note our subsequent frame uses bp; the saved inputs on our stack remain valid.
+
+One more micro-check: `cmpw -4(%%bp), %%di` — displacement -4 with bp ✔ disp8 ✔.
+
+I think also need to make sure the assembler accepts `call __muldf3` — direct near call to extern ✔. Possibly needs `@PLT`? Not for static linking elf16; plain symbol ✔.
+
+Final code:
+
+__asm__ __volatile__ (
+  "pushw %[A]\n\t"
+  "pushw %[y2]\n\t"
+  "pushw %[y1]\n\t"
+  "pushw %[x2]\n\t"
+  "pushw %[x1]\n\t"
+  "pushw %[n]\n\t"
+  "pushw %%bp\n\t"
+  "movw %%sp, %%bp\n\t"
+  "subw $10, %%sp\n\t"
+  "movw 2(%%bp), %%ax\n\t"
+  "addw %%ax, %%ax\n\t"
+  "addw %%ax, %%ax\n\t"
+  "addw %%ax, %%ax\n\t"
+  "movw %%ax, -2(%%bp)\n\t"
+  "movw 4(%%bp), %%di\n\t"
+  "movw %%di, %%bx\n\t"
+  "addw -2(%%bp), %%bx\n\t"
+  "movw %%bx, -4(%%bp)\n\t"
+  "movw 12(%%bp), %%bx\n\t"
+  "movw %%bx, -6(%%bp)\n\t"
+  "movw 8(%%bp), %%bx\n\t"
+  "movw %%bx, -8(%%bp)\n\t"
+  ".Lmvt_o1%=:\n\t"
+  "cmpw -4(%%bp), %%di\n\t"
+  "jae .Lmvt_e1%=\n\t"
+  "xorw %%si, %%si\n\t"
+  ".Lmvt_i1%=:\n\t"
+  "cmpw -2(%%bp), %%si\n\t"
+  "jae .Lmvt_i1e%=\n\t"
+  "movw -8(%%bp), %%bx\n\t"
+  "addw %%si, %%bx\n\t"
+  "pushw 6(%%bx)\n\t"
+  "pushw 4(%%bx)\n\t"
+  "pushw 2(%%bx)\n\t"
+  "pushw (%%bx)\n\t"
+  "movw -6(%%bp), %%bx\n\t"
+  "addw %%si, %%bx\n\t"
+  "pushw 6(%%bx)\n\t"
+  "pushw 4(%%bx)\n\t"
+  "pushw 2(%%bx)\n\t"
+  "pushw (%%bx)\n\t"
+  "call __muldf3\n\t"
+  "addw $16, %%sp\n\t"
+  "pushw %%bx\n\t"
+  "pushw %%cx\n\t"
+  "pushw %%dx\n\t"
+  "pushw %%ax\n\t"
+  "pushw 6(%%di)\n\t"
+  "pushw 4(%%di)\n\t"
+  "pushw 2(%%di)\n\t"
+  "pushw (%%di)\n\t"
+  "call __adddf3\n\t"
+  "addw $16, %%sp\n\t"
+  "movw %%ax, (%%di)\n\t"
+  "movw %%dx, 2(%%di)\n\t"
+  "movw %%cx, 4(%%di)\n\t"
+  "movw %%bx, 6(%%di)\n\t"
+  "addw $8, %%si\n\t"
+  "jmp .Lmvt_i1%=\n\t"
+  ".Lmvt_i1e%=:\n\t"
+  "addw $8, %%di\n\t"
+  "movw -2(%%bp), %%ax\n\t"
+  "addw %%ax, -6(%%bp)\n\t"
+  "jmp .Lmvt_o1%=\n\t"
+  ".Lmvt_e1%=:\n\t"
+  "movw 6(%%bp), %%di\n\t"
+  "movw %%di, %%bx\n\t"
+  "addw -2(%%bp), %%bx\n\t"
+  "movw %%bx, -4(%%bp)\n\t"
+  "movw 12(%%bp), %%bx\n\t"
+  "movw %%bx, -10(%%bp)\n\t"
+  "movw %%bx, -6(%%bp)\n\t"
+  "movw 10(%%bp), %%bx\n\t"
+  "movw %%bx, -8(%%bp)\n\t"
+  ".Lmvt_o2%=:\n\t"
+  "cmpw -4(%%bp), %%di\n\t"
+  "jae .Lmvt_e2%=\n\t"
+  "xorw %%si, %%si\n\t"
+  ".Lmvt_i2%=:\n\t"
+  "cmpw -2(%%bp), %%si\n\t"
+  "jae .Lmvt_i2e%=\n\t"
+  "movw -8(%%bp), %%bx\n\t"
+  "addw %%si, %%bx\n\t"
+  "pushw 6(%%bx)\n\t"
+  "pushw 4(%%bx)\n\t"
+  "pushw 2(%%bx)\n\t"
+  "pushw (%%bx)\n\t"
+  "movw -6(%%bp), %%bx\n\t"
+  "pushw 6(%%bx)\n\t"
+  "pushw 4(%%bx)\n\t"
+  "pushw 2(%%bx)\n\t"
+  "pushw (%%bx)\n\t"
+  "call __muldf3\n\t"
+  "addw $16, %%sp\n\t"
+  "pushw %%bx\n\t"
+  "pushw %%cx\n\t"
+  "pushw %%dx\n\t"
+  "pushw %%ax\n\t"
+  "pushw 6(%%di)\n\t"
+  "pushw 4(%%di)\n\t"
+  "pushw 2(%%di)\n\t"
+  "pushw (%%di)\n\t"
+  "call __adddf3\n\t"
+  "addw $16, %%sp\n\t"
+  "movw %%ax, (%%di)\n\t"
+  "movw %%dx, 2(%%di)\n\t"
+  "movw %%cx, 4(%%di)\n\t"
+  "movw %%bx, 6(%%di)\n\t"
+  "movw -2(%%bp), %%ax\n\t"
+  "addw %%ax, -6(%%bp)\n\t"
+  "addw $8, %%si\n\t"
+  "jmp .Lmvt_i2%=\n\t"
+  ".Lmvt_i2e%=:\n\t"
+  "addw $8, %%di\n\t"
+  "movw -10(%%bp), %%ax\n\t"
+  "addw $8, %%ax\n\t"
+  "movw %%ax, -10(%%bp)\n\t"
+  "movw %%ax, -6(%%bp)\n\t"
+  "jmp .Lmvt_o2%=\n\t"
+  ".Lmvt_e2%=:\n\t"
+  "movw %%bp, %%sp\n\t"
+  "popw %%bp\n\t"
+  "addw $12, %%sp"
+  :
+  : [n] "rm" (n),
+    [x1] "rm" (x1),
+    [x2] "rm" (x2),
+    [y1] "rm" (y_1),
+    [y2] "rm" (y_2),
+    [A] "rm" (A)
+  : "ax", "bx", "cx", "dx", "si", "di", "memory", "cc"
+);
+
+Wait: loop2's pushed a-arg uses S_pA WITHOUT adding si — correct (column pointer advanced in slot) ✔. And in loop2, after the last inner iteration we still add LIM to S_pA (harmless, will be overwritten at outer end: COL computed from S_COL not S_pA ✔). And outer2 end sets pA = new COL ✔ (we do movw %ax,-6 after computing new COL ✔—included).
+
+Check loop2 setup: S_COL = A; S_pA = A ✔ for i=0.
+
+One residual risk: the 64-bit return register assumption. Also possible that double args are passed differently? They're on stack, we match cdecl ✔. But wait—does ia16 gcc pass the FIRST few bytes of args in registers by default (like regparm=2)? If default regparm>0, __adddf3 would expect some args in regs! Hmm. ia16-elf-gcc supports -mregparm; default I believe is 0 (all on stack) for compatibility. libgcc compiled with default; as long as we use default convention it matches whatever libgcc uses — but we don't know default! If default were regparm=3, our stack-passing call would mismatch. Evidence: The function kernel_mvt in C receives 6 args; if ia16 default regparm... For 16-bit gcc, I'm fairly sure default regparm is 0; the -mregparm option exists but default stack passing (BSD-style). Also previous compile errors listed "memory input ... not directly addressable" under inlining which doesn't hint regparm. I'll assume stack.
+
+Also, "__muldf3" might be implemented as "__muldf3" taking args via... compiled C → default ABI ✔.
+
+Potential issue: unusual `subw $10, %sp` unaligned sp — irrelevant.
+
+Also `pushw %[A]` if A allocated in bp? Can't (bp reserved unless omit-frame-pointer). If omit-fp and input in bp: push bp ✔ value correct (input). ✔.
+
+One more: The C standard function kernel_mvt might not be inlined in test (compiled -O0): then n, x1... are stack params; "rm" gives memory like 4(%bp) with caller bp ✔ since pushes happen before we seize bp ✔.
+
+Danger: GCC could order template text exactly; yes asm template is verbatim.
+
+Now, `%=` works in extended asm ✔.
+
+Double-check offset mapping once more for loop2: x2 at 6(%bp): pushes: A(1st)→y2(2)→y1(3)→x2(4)→x1(5)→n(6th)→bp save. bp frame: 2=n,4=x1,6=x2,8=y1,10=y2,12=A ✔.
+
+Loop1 uses 4 (x1), 12(A), 8(y1) ✔. Loop2 uses 6(x2),12,10 ✔.
+
+Now consider DATA_TYPE arrays declared POLYBENCH_1D(x1,N,n): parameter decays to DATA_TYPE* (16-bit near) ✔ size 2 ✔ pushw ✔. A decays to pointer to array — still a pointer ✔.
+
+Also C type of n: int (16-bit) ✔.
+
+I'm fairly confident. Also add `#pragma`? No—just the code.
+
+Also should we mark outputs? none.
+
+Potential assembler complaint: `pushw (%%bx)` — parentheses syntax ✔.
+
+Also careful: in AT&T syntax `addw $16, %sp` ✔.
+
+Also `jae` on 8086 gas ✔.
+
+Frame slot -10(%bp) with bp-based disp8 ✔ range ok.
+
+Also, one concern: since we `subw $10,%sp`, our slots -2..-10 are BELOW bp i.e., within allocated 10 bytes: bp-10 == sp ✔ slot at -10(%bp) equals (%sp)... addressing via bp ✔ fine; note -10(%bp) is lowest slot, exactly at sp ✔ valid.
+
+During calls, pushes go below sp (below slots) ✔ restored ✔.
+
+Edge: if n==0: LIM=0, XEND=x1+0 → loop1 outer: jae taken immediately ✔ loop2 same ✔. Also A pointer may be NULL? malloc still returns? n=0 loops fine.
+
+I think this is correct. Output only the block.

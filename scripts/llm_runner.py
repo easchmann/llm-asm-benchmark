@@ -25,6 +25,19 @@ DUMP_BLOCK_RE = re.compile(r"begin dump:[^\n]*\n(.*?)end\s+dump", re.DOTALL)
 NUM_RE = re.compile(r"-?\d+\.\d+")
 
 
+def is_dump_output(path):
+    """True if a captured output file actually contains a polybench dump block.
+
+    Guards against counting QEMU/FreeDOS boot artifacts (empty, 0 B, or a small non-dump
+    binary blob like a boot sector) as a real graded run — the 8086 'mismatch'-bucket bug.
+    Inline-asm kernels that mutate memory but never print DUMP_ARRAYS come back here as
+    no_output (the x86 'compiles, runs, stores nothing' class), not mismatch."""
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    text = open(path, errors="replace").read()
+    return bool(DUMP_BLOCK_RE.search(text))
+
+
 def values(path):
     """Extract the numbers printed between begin/end dump markers."""
     if not os.path.exists(path):
@@ -184,7 +197,14 @@ def main():
     p.add_argument("--native", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--first-k", type=int, default=0)
+    p.add_argument("--dump-only", action="store_true",
+                   help="require a real DUMP_ARRAYS block in --out; boot artifacts / "
+                        "non-dump binaries grade as no_output instead of mismatch")
     args = p.parse_args()
+    if args.dump_only and not is_dump_output(args.out):
+        # no real dump block -> no_output (cache/empty/blob), not a graded mismatch
+        print("no_output 0/0")
+        return
     g = grade_outputs(args.native, args.out)
     line = f"{g['result']} {g.get('right',0)}/{g.get('total',0)}"
     if args.first_k and g["result"] == "mismatch":

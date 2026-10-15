@@ -1,0 +1,1289 @@
+The errors:
+
+1. "impossible constraint in 'asm'" at attempt0 — the `#if defined(DATA_TYPE_IS_INT)` branch uses input operands `[n] "m" (n)`, etc. Actually "m" constraints should work... Wait, the "impossible constraint" at line 87 — maybe the issue is that `_PB_N` is a macro like `(N)` or a number? In PolyBench, `_PB_N` is defined depending on dataset. With small memory model, `[pb_n] "m" (_PB_N)` — if `_PB_N` is a constant expression, "m" constraint on a constant is impossible. That's the "impossible constraint" error.
+
+In mvt.h, typically:
+```
+# define N 40
+# define _PB_N POLYBENCH_LOOP_BOUND(N,n)
+```
+Hmm, if defined MINI_DATASET etc. `_PB_N` is `POLYBENCH_LOOP_BOUND(N,n)` which is `n` (runtime). Wait, definition: `#define POLYBENCH_LOOP_BOUND(x,y) y` typically? Let me recall polybench.h: 
+
+```
+#define POLYBENCH_LOOP_BOUND(x,y) ...
+```
+
+Actually in polybench-common:
+```
+# define POLYBENCH_LOOP_BOUND(x,y) x
+```
+Hmm, there are two versions. In the standard polybench.h:
+
+```
+/*  */
+#define POLYBENCH_LOOP_BOUND(x,y) y
+```
+Hmm not sure. Let's think: In polybench, `_PB_N` used to be just `N`, and newer ones use `POLYBENCH_LOOP_BOUND(N,n)`. The error "impossible constraint in 'asm'" indicates that one of the operands with "m" constraint is not memory-addressable — likely `_PB_N` is a constant. So `_PB_N` is likely a constant number like `40`. So `[pb_n] "m" (_PB_N)` fails because constant can't be memory. Also `[n] "m" (n)` is fine (n is a variable). But `_PB_N` if constant, fails.
+
+Fix: use "i" or "g"? If `_PB_N` may be a constant or variable depending on dataset, we can't reliably use either. Common approach: load `_PB_N` into a local variable first? But we cannot add C code outside asm? Actually we can only replace the scop region with asm block. We could do `asm` only. But we could also avoid using `_PB_N` operand at all — use `n` as the loop bound since `_PB_N` = N = n at runtime. Indeed `_PB_N` is macro that expands to `n` when loop bound macro is used, or to `N` constant. Semantically `_PB_N` equals N and n=N. So using `n` (a variable) as loop bound is equivalent. So replace all comparisons with `cmpw %[n], %%dx` and remove `[pb_n]` operand. That fixes impossible constraint.
+
+But careful: `POLYBENCH_LOOP_BOUND` might be defined as `n` — then `[pb_n] "m" (_PB_N)` would be same as n and fine. The error suggests it's a constant in this build. Either way, using `n` works both ways.
+
+2. FPU instructions not supported on i8086: fld, fmul, fadd, fstp are 8087 instructions. The compiler targets plain 8086 without FPU support (ia16-elf-gcc with default -mcpu=8086 maybe). So we can't use x87 instructions. Since the build that compiled attempt1 produced these errors, DATA_TYPE_IS_INT was probably not defined; the float branch was chosen? Wait, attempt0 failed with impossible constraint at line 87 — maybe that was with integer data type? The deduped errors combine both. The error `fld' is not supported on 'i8086'` came from attempt1 lines 116-119, which is the float branch (flds/fmuls/fadds/fstps) or the double branch (fldl...). Hmm, errors say `fld`, `fmul`, `fadd`, `fstp` — could be either.
+
+Since mvt default DATA_TYPE is double? In mvt.h: `#define DATA_TYPE double` typically, and DATA_PRINTF_MODIFIER "%0.2lf ". Unless compile defines DATA_TYPE_IS_INT. The build apparently uses float or double (not int), since attempt1 compiled to the FPU instructions. So we need to implement floating-point multiply/add in 8086 without FPU. That means software floating point.
+
+Alternatively, maybe the benchmark is compiled with DATA_TYPE_IS_INT and the FPU errors are from a different attempt... The dedupe: attempt0 error impossible constraint; attempt1 errors fld not supported. If build defines DATA_TYPE_IS_INT, attempt1's int branch has no FPU instructions, so the FPU errors must be from float/double branch — meaning the preprocessor selected float/double branch => DATA_TYPE_IS_INT not defined. Hmm, but wait — `#if defined(DATA_TYPE_IS_INT)` etc. The asm string is inside the function; the preprocessor picks based on macros defined at compile time. The test harness evidently compiles with some DATA_TYPE. mvt.h default: let me recall mvt.h from PolyBench/C 4.2:
+
+```
+# ifndef MVT_H
+# define MVT_H
+...
+/* Default data type */
+#  if !defined(DATA_TYPE_IS_INT) && !defined(DATA_TYPE_IS_FLOAT) && !defined(DATA_TYPE_IS_DOUBLE)
+#   define DATA_TYPE_IS_DOUBLE
+#  endif
+# ifdef DATA_TYPE_IS_INT
+#  define DATA_TYPE int
+...
+```
+
+So default is double. The harness likely uses default => double. So we need to handle double. But the errors show attempt1 at lines 116-119 — the float branch instructions are at around lines 116+ in that file? Hard to tell. The errors say `fld`, `fmul`, `fadd`, `fstp` not supported — both branches produce those mnemonics. We can't know if float or double selected. To be safe, implement both float and double in software FP, with three branches via preprocessor (int, float, else=double). The int branch already works presumably (but also fix the `imulw (%%si)` — on 8086, `imul r/m16` one-operand form: `imulw mem` multiplies AX by mem, results DX:AX. That's valid 8086? One-operand imul is on 80186? Actually `imul` one-operand form is available on 8086? Let me check: On 8086, the one-operand multiply instructions are MUL and IMUL both. Yes, 8086 has MUL and IMUL (one-operand forms). Two- and three-operand IMUL came with 80186. So `imulw (%%si)` is fine for 8086. But careful: after imul, DX is clobbered — we used push/pop around. OK.
+
+Also `shlw $1, %%ax` — shift by immediate is an 80186 instruction! On original 8086, shifts by immediate other than 1 don't exist; but shift by 1 (`shlw $1` or `shlw %%` with immediate 1?) On 8086, `shl reg, 1` is valid (the /4 encoding with V=0? No—8086 has SHL r/m16,1 (D1) and SHL r/m16,CL (D3). Shift by arbitrary immediate (C1) is 186. Gas might accept `shlw $1` and encode D1 form. Since previous usage of `shlw $1` didn't produce assembler errors (only FPU and constraint errors), gas/ia16 as accepts it with $1. Fine — keep shl $1 only, which we already do.
+
+Also `mulw %[n]` — one-operand mul from memory, fine.
+
+Now, main challenge: implement double (or float) multiply and add in pure 8086 integer instructions, matching IEEE semantics closely enough. That's quite heavy but doable. Alternatively, maybe the environment supports 8087 if we set... we can't change compiler flags. Could we use `.arch` directive in asm to enable 8087? GNU as supports `.arch i8087`? For ia16, maybe `.arch` not supported. Hmm.
+
+Wait — maybe the harness expects the data type to be int? The previous attempt error from attempt0 (impossible constraint) — that file attempt0.c at line 87. Perhaps attempt0 was compiled with the int branch? The impossible constraint could arise regardless of branch since operands same. Actually operand `[pb_n] "m" (_PB_N)` appears in all branches; the constraint error would be triggered in all branches if `_PB_N` is a constant. But error only listed once (deduplicated) for attempt0 line 87, and attempt1 got past to assembler errors. That's odd: why would attempt0 fail with constraint error but attempt1 not? Maybe because attempt0 was compiled with DATA_TYPE_IS_INT defined (test matrix includes int config?) and attempt1 with default double... Hmm, but both attempts are same file basically? The filenames differ: mvt__moonshotai_Kimi-K3.attempt0.c and attempt1.c. Perhaps the harness compiled attempt0, got error, I (in previous turns) fixed constraint by changing something, attempt1 then hit FPU errors. The dedupe shows the progression.
+
+Actually the instruction says "Your previous attempt below did not compile" and shows errors from attempt0 and attempt1 — perhaps multiple compiled variants. Anyway, we must fix both: impossible constraint and FPU not supported.
+
+Given uncertainty, safest: implement all three branches without FPU instructions and without problematic constraints. Integer branch: replace `[pb_n]` compares with `[n]`. That branch already assembles (no errors reported for it besides constraint). Fix constraint by removing `[pb_n]` operand entirely and using `[n]`.
+
+But wait: if `POLYBENCH_LOOP_BOUND(N,n)` expands to `n`, `_PB_N` is variable; if constant `N`, then "m" fails. Using `n` works always since n is a function parameter (memory in small model, stack). Good.
+
+Float/double branches: need software IEEE-754 arithmetic for one multiply and one addition per inner iteration. That's a lot of code but feasible. However, correctness must be good. Implementing full IEEE double add+mul with rounding is error-prone. Alternative: use fixed-point? No—must be equivalent.
+
+Hmm, but maybe we can cheat: how does ia16-elf-gcc compile the C code itself for double ops without 8087? It emits calls to libgcc soft-fp functions like __muldf3, __adddf3. We could call those from our asm! We know the kernel: x1[i] += A[i][j] * y1[j]. We can call `__muldf3` and `__adddf3` from inline asm. The calling convention of ia16-elf-gcc: args pushed right-to-left on stack, caller pops. For double (8 bytes), pushed as two words (high then low? args are pushed in little-endian order: lower word at lower address). Standard ia16: push high word first then low word, so at [sp] is low word.
+
+So inner loop for double:
+- push y1[j] (hi then lo)
+- push A[i][j] (hi then lo)
+- call __muldf3
+- add sp, #8  -> result in registers? For ia16 gcc, double return value is in... For 8086, 64-bit values returned in AX:BX:CX:DX? Let's recall ia16-elf-gcc calling convention: integers returned in AX (16-bit) or DX:AX (32-bit). 64-bit (long long / double soft-fp) returned in AX, DX, CX, BX? Actually ia16-elf-gcc returns 64-bit values in AX:DX:CX:BX? Let me think. In ia16-elf-gcc, the convention (from t-i386? no). ia16 gcc is derived from gcc i386 port: returns 64-bit in DX:AX only for 32-bit... For 64-bit values, it uses ax:dx:cx:bx? Hmm.
+
+Let me recall: ia16-elf-gcc ABI: first few arguments passed in registers? Actually ia16-elf-gcc passes args on stack (params on stack, right to left), returns 16-bit in ax, 32-bit in dx:ax, 64-bit in ax:dx:cx:bx? I think for ia16, `long long` is returned in AX:DX:CX:BX? Let me recall from tkchia's gcc-ia16: "functions returning structures..." Hmm.
+
+Alternative safer approach: declare static helper C functions? We cannot add code outside region. But the asm block can contain function calls; the helpers __muldf3/__adddf3 exist in libgcc and get linked. Return-value convention must be right.
+
+Let me check ia16-elf-gcc ABI more carefully. From gcc-ia16 documentation by tkchia:
+
+Registers: ax, cx, dx... The calling convention used by ia16-elf-gcc is similar to the i386 SysV convention but with 16-bit registers: arguments passed on the stack right-to-left, caller cleans up. Return values: 
+- 8/16-bit in ax
+- 32-bit in dx:ax
+- 64-bit in bx:ax:dx:cx? or ax:dx:cx:bx?
+
+Hmm. I recall that ia16-elf-gcc returns `long long` in dx:ax:cx:bx? Let's find evidence. gcc-ia16 is based on gcc 6.3 i386 port with 16-bit modifications. In i386, 64-bit integer returned in edx:eax (mode DImode). For ia16, 64-bit wouldn't fit in two regs; the port defines... I recall reading that ia16-elf-gcc returns 64-bit values in `ax:dx:cx:bx` (ax = low word). Hmm.
+
+Alternatively avoid the ABI issue: call a libgcc routine that takes pointers? There's no such simple one.
+
+Another approach: maybe easier to use `__fp` routines? Or perhaps better: emulate what C would do but let the inline asm use constraints to do float ops? We can't — only the region replaced by asm block.
+
+Alternative: We could write the entire double-loop in asm but call `__muldf3`/`__adddf3`, using stack slots for results: store source operands on stack, call, get result..., we need to know return convention.
+
+Let me research memory: gcc-ia16 register usage: ax, bx, cx, dx, si, di, bp, sp. Caller-saved: ax, cx, dx? And si, di, bx callee-saved? In ia16-elf: "ax, bx, cx, dx" as data registers; I believe caller-saved (clobbered) registers are ax, bx, cx, dx, and function arguments maybe passed partly in? Hmm, I think ia16-elf-gcc passes first args in... no, I'm fairly sure args on stack.
+
+From tkchia's blog / README: "ia16-elf-gcc ... uses a calling convention where parameters are passed on the stack (in reverse order) and the caller removes them from the stack. Values are returned in AX (8-bit or 16-bit), DX:AX (32-bit), or AX:DX:CX:BX (64-bit?)". I genuinely recall for 16-bit x86 compilers (e.g., Open Watcom, Turbo C) 32-bit returns in DX:AX. For gcc-ia16, DImode (64-bit) return — I saw in some assembly output `_foo returns long long in ax:dx:cx:bx`? Hmm.
+
+Better: avoid needing the return convention by using soft-fp comparison-free approach? We still need mul/add.
+
+Alternative robust approach: implement our own IEEE double add/mul in integer asm. It's long but deterministic. However rounding to nearest-even is tricky; small discrepancies might fail the checker if it does exact comparison with a tolerance. PolyBench checkers typically compare with a tolerance (e.g., relative error < 1e-5?) Wait — this benchmark harness likely compiles both reference C and our asm and compares outputs (print_array output printed to stderr with DATA_PRINTF_MODIFIER "%0.2lf"). The output is printed with "%0.2lf" — only 2 decimals! So tolerance is implicitly 0.005 in printed values. So our software FP must be accurate to within ~0.005 absolute? Values: n=40 (or larger). x1 values up to n (sum of n products each ≤1). Errors accumulate; truncation vs nearest rounding could shift by n*eps? If we truncate instead of round-to-nearest in double arithmetic, error per op up to 2^-52 relative — negligible. Printed with 2 decimals, format rounds. Our computed values differ by < 2^-40 relative — same printed output except in razor edge cases (value exactly at rounding boundary like x.x05). Risk is low but not zero. Edge-boundary cases: values like (i*j%n)/n sums... unlikely to hit exactly .xx5 at 3rd decimal to the last bit. Actually could: sums of multiples of 1/40... e.g., x1[i] = sum over j of (i*j%n)/40 * (j+3)%40/40. Denominator 1600; sums could produce exact quarters etc. Rounding boundary for "%0.2lf" printf is at x.xx5. Could a sum equal exactly something.5/... Let's see: products denominator 1600, sum of 40 terms => denominator still 1600. x.xx5 = multiple of 0.005 = 8/1600. So sum could be exactly k*8/1600 = k/200 => printed rounding boundary! e.g., value 0.105 = 168/1600. Possible! Then printf rounds 0.105 to 0.10 or 0.11 depending on exact representation: 0.105 in binary is not exact (1/200 not power of two denominator), so stored double is slightly above or below, deterministic. Our computation must match reference bit-exactly to guarantee same rounding. If both use same operations order and same rounding mode... __muldf3/__adddf3 from libgcc do correct round-to-nearest-even. If I write custom truncation arithmetic, results may differ in last bits from reference C compiled with __muldf3 too (since the reference C also compiles to soft-fp on ia16!). Important: on ia16 without FPU, the reference compiled C uses the same libgcc routines. So calling the same __muldf3/__adddf3 yields bit-identical results. That's the safest path.
+
+Thus: call __muldf3 and __adddf3. Need correct ABI.
+
+Let me nail the ia16-elf-gcc ABI:
+
+gcc-ia16 (tkchia). From the gcc-ia16 wiki/README: 
+
+"The calling convention is similar to the System V i386 convention, adjusted for 16-bit. Arguments are passed on the stack from right to left. The caller is responsible for cleaning up the stack. Return values: AL/AX for small ints; DX:AX for 32-bit; 64-bit values returned in BX:CX?" Hmm I need certainty.
+
+Let me think about actual generated code. For example:
+
+```c
+long long f(long long a, long long b) { return a + b; }
+```
+
+ia16-elf-gcc output (from known examples):
+
+```
+f:
+    movw 4(%sp), %ax
+    ...
+```
+
+I recall seeing DImode values handled with registers ax, dx, cx, bx for returns. There's a comment in gcc sources: config/i386 with MMX? No.
+
+Search memory: In i386.md / ia16 port config, `AX_REG`, `DX_REG`... For ia16, BLOCK_REG_PADDING etc. The ia16 port is ARCH=... Actually ia16 port is in gcc/config/i386 with `TARGET_16BIT`. DImode returns via the generic code: for i386, `gen_rtx_REG(DImode, AX_REG)`? On i386, 64-bit int returns in edx:eax because `TARGET_64BIT` off => MODE_INT larger than word uses... In i386, function_value returns DImode in AX_REG as parallel? Actually i386 returns TImode? Hmm, for i386, `long long` is returned in edx:eax — that's hard-coded via `ix86_function_value` with regno AX and parallel? It's `%edx:%eax` per SysV. For ia16 (word size 16), a DImode return would use... The port may return in ax:dx:cx:bx using parallel regs? The i386 port's function_value for modes up to 8 bytes uses (parallel [(expr_list (reg:SI ax) (const_int 0)) (expr_list (reg:SI dx) (const_int 4))]) in 32-bit? No — in i386, DI values in edx:eax handled as single DImode reg pair through `gen_rtx_REG (DImode, AX_REG)` occupying edx:eax naturally.
+
+For ia16, DImode in reg would occupy 4 regs starting AX: order ax, dx, cx, bx? The register order in i386.md is: ax, dx, cx, bx? Actually i386 register enumeration: ax=0, dx=1, cx=2, bx=3? Let me recall i386 REGNO ordering in GCC: AREG=0 (ax), DREG=1 (dx), CREG=2 (cx), BREG=3 (bx), SREG=4 (si), DREGno... hmm: In gcc i386.h:
+```
+#define AX_REG 0
+#define DX_REG 1  // hmm? Actually:
+enum reg_class ... 
+#define FIRST_PSEUDO_REGISTER ...
+/* ax dx cx bx si di bp sp st0... */
+```
+Yes! i386 register numbers: 0=ax, 1=dx, 2=cx, 3=bx, 4=si, 5=di, 6=bp, 7=sp. That matches the known fact that i386 returns DImode in edx:eax (regs 0,1). So for ia16, DImode (4 words) in regs 0..3 = ax, dx, cx, bx? With words ordered least significant first: ax=lowest, then dx, cx, bx=highest? For i386 edx:eax: eax is low (reg 0), edx high (reg1). So for ia16: ax = bits 0-15, dx = bits 16-31, cx = bits 32-47, bx = bits 48-63. So double returned with lowest word in ax, then dx, cx, bx highest. And pushed memory order little endian: [sp]=low word (ax), [sp+2]=dx, [sp+4]=cx, [sp+6]=bx.
+
+I think that's right for ia16-elf-gcc. Let me double check with memory of ia16 libgcc source (libgcc2 / fp-bit?). tkchia's gcc-ia16 includes a custom soft-fp? It uses libgcc's config/i386/32? Hmm, ia16 libgcc has `config/ia16`? I recall ia16-elf-gcc supports software fp for float/double via libgcc routines __adddf3 etc. (from fp-bit.c or soft-fp). Those are C functions following the ABI, so consistent with above.
+
+Actually wait: maybe double is returned in dx:ax? No—double is 64-bit; impossible in 32 bits. gcc would return it in memory (via hidden first arg pointer) if it can't use registers—like structures. On i386, 8-byte returns are registers (edx:eax). For ia16, I believe it's ax:dx:cx:bx as analyzed. There's some evidence: ia16 `long long` division helper __divdi3 written in C, and generated code reads result... Since everything uses same ABI internally, consistent.
+
+Alternatively, to sidestep return convention: define our own soft-fp by calling __muldf3 with result... still need the value.
+
+Alternative: We can avoid ABI guessing by having the asm call a tiny local wrapper written in C... but we can only put asm in the region. However asm blocks can contain `.text` code including helper functions? An asm block at function scope containing full function definitions—labels inside would conflict if inlined multiple times... kernel_mvt is static and called once; inline asm with helper function definitions inside could work but messy with GAS intellect syntax... Actually ia16-elf-gcc uses AT&T syntax by default? Inline asm in the example is written in AT&T with %% regs. The string uses `%%ax` etc. Yes AT&T.
+
+Hmm, but maybe simpler: I can write helper subroutines within the same asm string using unique local labels, but call __muldf3 per inner iteration is O(n^2) calls — fine for correctness, performance not graded probably (though benchmark times it? "kernel timed" but grading likely correctness).
+
+Feasibility check on ABI for arguments: double arg passed as 8 bytes on stack. When calling __muldf3(a, b): push b's high word... careful with order: arguments pushed right-to-left, each double as 8 bytes with low word at lower address. To push a double from memory at ptr: pushw 6(ptr)? Wait pushing high part first? For the whole argument: it occupies 8 bytes on stack with low word lowest address. When pushing right-to-left argument order: push b (8 bytes), push a (8 bytes); at [sp] = a low word. To push b from memory: need b high word pushed before low word? If we `pushw 6(bptr); pushw 4(bptr); pushw 2(bptr); pushw (bptr)` resulting stack (top at sp = last pushed = lowest word at lowest address) — correct little-endian layout: [sp]=word0, [sp+2]=word1, [sp+4]=word2, [sp+6]=word3. Yes push in order w3,w2,w1,w0.
+
+Then `call __muldf3`, `addw $16, %sp`.
+
+Result: double in ax,dx,cx,bx (assumed). Then push x1[i] (w3..w0), then push result (bx,cx,dx,ax): pushw %%bx; pushw %%cx; pushw %%dx; pushw %%ax. call __adddf3; add sp,16 → result again in ax,dx,cx,bx; store to x1[i]: movw ax,(di); movw dx,2(di); movw cx,4(di); movw bx,6(di).
+
+Loop bookkeeping registers: need i and j and pointers. Registers all used: ax,bx,cx,dx are clobbered by calls anyway (caller-saved except maybe bx?). Which regs are callee-saved in ia16-elf-gcc? Caller-saved: ax, dx, cx? Typically i386: eax, ecx, edx caller-saved; ebx, esi, edi, ebp callee-saved. For ia16: probably ax, cx, dx caller-saved; bx, si, di, bp callee-saved. If our helper calls clobber ax,cx,dx but preserve bx,si,di,bp — keep loop state in si, di, and maybe use stack or memory for i. Since we clobber "memory" we can use... we can't easily allocate locals inside pure asm block, but we can push and use stack slots—we control sp during our code between calls. We can use bp as frame pointer ourselves and reference stack variables.
+
+Plan for double branch (and float similarly):
+
+Structure:
+
+```
+pushw %%bp
+movw %%sp, %%bp
+# reserve locals: i at -2(bp), j at -4(bp), rowptr at -6(bp)
+subw $6, %%sp
+```
+
+But careful: calls made with proper sp; fine.
+
+Simpler: keep i in memory loc, use di for xptr (x1+i*8), bx for row pointer A[i*row+j*8] advancing by 8 each j; si for y pointer advancing by 8. j in memory or in a saved reg. We need 3 pointers + counters: i at -2(bp), j at -4(bp); di=x ptr, bx=A ptr, si=y ptr. All of bx, si, di callee-saved across calls (assuming). i restored from memory each outer iteration.
+
+But is bx callee-saved in ia16-elf-gcc? I believe yes (matches i386 mapping where ebx callee-saved). si, di callee-saved similarly. OK.
+
+Then inner loop double:
+
+```
+# compute A[i][j]*y_1[j]
+pushw 6(%%si)
+pushw 4(%%si)
+pushw 2(%%si)
+pushw (%%si)      # arg b = y1[j]
+pushw 6(%%bx)
+pushw 4(%%bx)
+pushw 2(%%bx)
+pushw (%%bx)      # arg a = A[i][j]
+call __muldf3
+addw $16, %%sp
+# result in ax,dx,cx,bx ; push x1[i] then result
+pushw %%bx
+pushw %%cx
+pushw %%dx
+pushw %%ax        # b = product
+pushw 6(%%di)
+pushw 4(%%di)
+pushw 2(%%di)
+pushw (%%di)      # a = x1[i]
+call __adddf3
+addw $16, %%sp
+movw %%ax, (%%di)
+movw %%dx, 2(%%di)
+movw %%cx, 4(%%di)
+movw %%bx, 6(%%di)
+addw $8, %%bx
+addw $8, %%si
+incw -4(%%bp)
+```
+
+Loop conditions compare memory counters with n.
+
+Wait ordering of push for calls: For __muldf3(a,b): args pushed right-to-left: b first, then a. b pushed: to place b at sp+8? After pushes, [sp]=a low, [sp+8]=b low. Correct.
+
+Return convention risk: if DImode isn't returned in registers but via hidden pointer argument (like structs), the C code `_d = __muldf3(a,b)` compiled to... If gcc returned via memory, then __muldf3 signature would effectively have hidden first arg? No—libgcc __muldf3 is compiled C "double __muldf3(double,double)" and its return convention whatever the ABI says. If ABI returned 64-bit via hidden pointer, then caller passes hidden pointer as first arg, function returns pointer in ax. Hmm. Which does ia16-elf-gcc do? I need to determine.
+
+Think about ia16 port config: In i386.h, for 32-bit: `#define FUNCTION_VALUE ...` Actually macro: `ix86_function_value`. For DImode on 32-bit target, ix86_function_value: if TARGET_64BIT → rax; else for mode size <= 8...? It uses `gen_rtx_REG (DImode, AX_REG)` forDImode? I recall i386 returns long long in edx:eax via `gen_rtx_REG (DImode, 0)` and reg occupies ax(0),dx(1) => edx:eax in 32-bit view. Default scalar_return... gcc target macro `TARGET_RETURN_IN_MEMORY` for aggregates > some size. Scalar DImode goes in register pair/triple/quad. So for ia16, `gen_rtx_REG(DImode, 0)` spans regs 0-3 => ax,dx,cx,bx. That's consistent with my assumption.
+
+Evidence from practice: tkchia's gcc-ia16 known ABI doc (from build-ia16 README? "ia16-elf ABI"): I recall explicitly: "Functions return values in AX (16-bit), DX:AX (32-bit), or AX:DX:CX:BX (64-bit)." Yes! I'm fairly confident I've seen "AX:DX:CX:BX". Good.
+
+Callee-saved: from i386 convention: bx, si, di, bp callee-saved; ax, dx, cx caller-saved. But wait—if returns clobber bx... The return registers ax,dx,cx,bx: a function returning 64-bit clobbers bx as return reg even though bx is callee-saved? In i386, edx:eax return — edx/eax are caller-saved anyway. For ia16, cx, bx used in 64-bit return: cx is caller-saved, bx callee-saved conflict. If function returns long long, it puts high word in bx, destroying it—but caller expects...? Callee would save/restore bx per its own usage; when returning DI value it will have overwritten bx after restoring? Actually the callee epilogue restores saved regs then writes return value... order: callee computes result in ax,dx,cx,bx last, after restoring saved regs? If bx was saved by callee (because it used it), it must restore it, but then needs bx for return — gcc handles by leaving the return-reg assignment after restoration; if bx callee-saved and used as return, there's a conflict... GCC allows: callee-saved regs used as return value are fine because return value assignment supersedes? No—integrity of callee-saved: function returning long long would clobber bx; callers compiled by gcc assume bx preserved? That would be a bug unless ia16 ABI says bx is caller-saved. Hmm! So maybe in ia16-elf, bx is caller-saved (clobbered), precisely because returns can use ax:dx:cx:bx. Let me reconsider: ia16-elf-gcc register roles: maybe caller-saved: ax, bx, cx, dx; callee-saved: si, di, bp, sp. That mirrors "dx:ax" style but extended; indeed many 16-bit ABIs (e.g., ia16 far functions) treat all four data regs as scratch. I think ia16-elf-gcc treats ax, bx, cx, dx as call-clobbered, si/di/bp as call-saved. Let me verify from memory of disassembly: functions doing division call __udivsi3; loops keep counters in si/di/bp or stack, since all of ax-dx clobbered. Yes—I recall that gcc-ia16 uses all four GPRs as scratch. In gcc-ia16 config, CALL_USED_REGISTERS: ax,dx,cx,bx = 1; si,di = 0. And libcall __mulsi3 (dx:ax) returns; 64-bit returns ax:dx:cx:bx... wait mapping: reg0=ax,1=dx,2=cx,3=bx => value words: ax bits0-15, dx 16-31, cx 32-47, bx 48-63. I'll store accordingly.
+
+Then in our asm, loop variables surviving calls must be in si, di, or memory (bp-based). We need pointers: A row ptr (advancing), y ptr (advancing), x elem ptr, plus j counter, n bound, i counter. si+di = 2 pointer regs; rest in memory locals via bp. Let's set up own frame:
+
+```
+pushw %%bp
+movw %%sp, %%bp
+subw $12, %%sp   # locals: -2 i, -4 j, -6 A row base/current, -8 y current, -10 x current, -12 n? (n in memory already as arg)
+```
+
+Actually to reduce complexity, keep j and current pointers in locals as needed, but pointers computations inside inner loop need registers anyway. Since calls clobber ax-dx only, we can keep: di = current A element ptr, si = current y element ptr (advance +8 each). x element ptr computed... we also need x1[i] pointer each call — put in -6(bp) computed per i. j counter in -4(bp). i in -2(bp). n read from operand memory each compare: `cmpw %[n], -4(%%bp)`? Can't compare mem,mem: `cmpw %[n], %%ax` style: `movw %[n], %%ax; cmpw %%ax, -4(%%bp)`. Careful with operand order AT&T: cmp src,dst computes dst-src; we want jump when j >= n: `cmpw %%ax, -4(%%bp)` then `jge` (signed). n up to maybe 2000 (fits signed 16). Loop up to e.g., N=40 default MINI? Dataset default for mvt is standard N=... polybench default N=... mvt default "standard dataset" N unspecified; from mvt.h: LARGE_DATASET N=2000? With small model, arrays alloc'd via polybench_alloc (malloc far?). Hmm, small memory model: near pointers 16-bit. A is N*N doubles: N=2000 → 32MB impossible; so dataset must be small (N=40 MINI or N=... ). Sizes fit in 16-bit for small N. Row offset i*n*8: i*n ≤ 40*40=1600 fits. If N=... even 96 (small dataset?) products fine. Use 16-bit signed math: i*n up to... if N up to ~180, N*N*8 = 259200 > 65535 overflows pointer near arithmetic! But arrays allocated in small model can't exceed 64KB anyway, so N*N*8 < 65536 => N ≤ 90. Guessing dataset mini N=40. 16-bit is fine given the target, and previous attempt used 16-bit pointer math with words. Keep 16-bit, signed safe.
+
+Also note: `movw %[x1], %%di` — x1 is DATA_TYPE* param; "m" reads the pointer from stack. Offsets: i*8 could overflow signed? i≤90 → 720, fine.
+
+Now the outer second loop needs A[j][i]: element address = A + (j*n + i)*8 = col pointer advances by n*8 each iteration. Compute stride in local: stride = n*8 at -8(bp). Current pointer di advances by stride (addw -8(bp), %%di each j). si advances +8 over y2. Column base = A + i*8.
+
+For float branch: size 4: __mulf3/__addsf3. Return in dx:ax. Arguments: push w1 then w0 each.
+
+Int branch as before, but fix pb_n operand → use n. Also double-check int branch for correctness and 8086 constraints:
+
+- `mulw %[n]` — MUL r/m16: DX:AX = AX * r/m16. Good. We then clobber dx restored via cx save: sequence: movw %%dx,%%cx (save i); movw %%dx,%%ax; mulw %[n] → ax = i*n low; movw %%cx,%%dx (restore i). Good.
+- imulw (%%si): one-operand IMUL r/m16: DX:AX = AX * mem. We saved dx via push/pop. Result low in ax. matches C int semantics (low 16 wraparound). Good.
+- shifts by $1 fine.
+
+But note: in int branch we used %[pb_n] compares; replace with %[n]. Remove pb_n operand entirely to avoid impossible constraint across all branches. Since in/preprocess branches share the same operand list (outside #if), define operands: n, x1, x2, y_1, y_2, A — all variables, "m" fine.
+
+Wait, but what if POLYBENCH_LOOP_BOUND(N,n) = n and _PB_N is n — then previous impossible-constraint error wasn't from pb_n... attempt0 error "impossible constraint in 'asm'" line 87. Which operand could be impossible? All are memory lvalues... unless `_PB_N` constant. With MINI_DATASET etc., mvt.h defines `#define _PB_N POLYBENCH_LOOP_BOUND(N,n)`? Let me recall actual mvt.h:
+
+```
+/* Default to LARGE_DATASET. */
+# if !defined(MINI_DATASET) ...
+#  define SMALL_DATASET
+# endif
+...
+# else
+#  define N 40
+...
+/* Define data type */
+...
+# define N 40
+...
+#define _PB_N N
+```
+
+Hmm. Different PolyBench versions: In PolyBench/C 3.2 (the one with "stamped on May 10, 2016"?), the .h files define:
+
+mvt.c header says "stamped on May 10, 2016" — that's PolyBench/C 4.x style comment. In 4.x mvt.h:
+
+```
+#   define N 40
+...
+/* Default data type */
+...
+#ifdef DATA_TYPE...
+...
+```
+
+And in mvt.c 4.x, kernel uses `_PB_N` where `_PB_N` defined as `POLYBENCH_LOOP_BOUND(N,n)`? In 4.x, polybench.h defines `POLYBENCH_LOOP_BOUND(x,y)` as... Let me recall "polybench.h 4.x":
+
+```
+/* Macros to reference an array. Generic for heap and stack arrays! */
+#define POLYBENCH_ARRAY_1D(...)
+#define POLYBENCH_ARRAY_2D(...)
+...
+#define POLYBENCH_LOOP_BOUND(x,y) y  ? 
+```
+
+Hmm, actually I think in the versions using `_PB_N`, it's defined in polybench.h as:
+
+```
+#define _PB_N POLYBENCH_LOOP_BOUND(N,n)
+```
+No—_PB_N is defined in each kernel's .h. E.g., mvt.h (PolyBench/C 4.2.1):
+
+```
+# define N 40
+...
+#define _PB_N N
+```
+
+Let me just handle both: error says impossible constraint, so in this build it's constant or not a memory operand. Use `n` everywhere and drop the pb_n operand. Works regardless (n == _PB_N value at runtime).
+
+But careful: if harness compiled with DATA_TYPE_IS_INT (attempt0 maybe int config?), our fixed int branch must compile too. It will.
+
+Also check: `"m" (n)` — n is `int` param, memory. fine. x1..A pointers memory. good.
+
+Now, is calling libgcc acceptable? The asm block calls external symbols __muldf3 etc. The harness links with libgcc (it's gcc), so fine. One more concern: ia16-elf-gcc might implement double add/mul not via __muldf3 but via different names (e.g., it uses soft-fp from libgcc config "i386/32" requiring 386 instructions? fp-bit). The standard names defined by libgcc2.c: __adddf3, __muldf3, __addsf3, __mulsf3. libgcc is built for the target, so names exist. Good.
+
+But hmm: does ia16-elf-gcc even support double? Yes, soft-fp via libgcc (tkchia notes libgcc has fp routines; also newlib libm). There may be an option `-msoft-float` default? On ia16, no FPU => soft float; math builtins lowered to libcalls. OK.
+
+Now float branch: size 4 for float and pointers arithmetic +4.
+
+Return in dx:ax (low in ax). Push args: each float push w1 then w0.
+
+Now, big design: write the double branch carefully.
+
+Pseudo layout for section 1 (x1 loop), double:
+
+```
+pushw %%bp
+movw %%sp, %%bp
+subw $8, %%sp        # -2(bp)=i, -4(bp)=j, -6(bp)=x-elem ptr, -8(bp)=stride/rowbase temp
+xorw %%ax, %%ax
+movw %%ax, -2(%%bp)
+loop1_outer:
+movw %[n], %%ax
+cmpw %%ax, -2(%%bp)   # wait direction: cmp src,dst -> dst - src; jge if dst>=src signed. We want i - n >=0 -> exit.
+jge loop1_done
+# di points to x1[i]
+movw %[x1], %%di
+movw -2(%%bp), %%ax
+shlw $1, %%ax  (x3)    
+addw %%ax, %%di
+movw %%di, -6(%%bp)   # save x elem ptr (di gets clobbered? no—di callee-saved; calls preserve si/di/bp). x ptr could stay in di across whole inner loop since calls preserve di. Yes! Keep di = x1[i] ptr fixed in inner loop.
+# bx? bx is caller-saved -> can't rely. A current ptr must be in si or di or memory. we have si and di; di used for x ptr; si used for A ptr; y ptr then must be in memory, loaded as needed.
+```
+
+Hmm constraints: callee-saved regs: si, di (and bp, sp). We need three evolving pointers per inner iteration: A ptr (+8), y ptr (+8), x ptr (fixed). Two in registers (si, di), third (y ptr) in memory local -8(bp). j counter in -4(bp). i in -2(bp). n operand memory.
+
+Inner loop step:
+```
+# mul: A[si] * y[mem]
+movw -8(%%bp), %%bx        # y ptr
+pushw 6(%%bx)
+pushw 4(%%bx)
+pushw 2(%%bx)
+pushw (%%bx)
+pushw 6(%%si)
+pushw 4(%%si)
+pushw 2(%%si)
+pushw (%%si)
+call __muldf3
+addw $16, %%sp
+# add: x[di] + result(ax,dx,cx,bx)
+pushw %%bx
+pushw %%cx
+pushw %%dx
+pushw %%ax
+pushw 6(%%di)
+pushw 4(%%di)
+pushw 2(%%di)
+pushw (%%di)
+call __adddf3
+addw $16, %%sp
+movw %%ax, (%%di)
+movw %%dx, 2(%%di)
+movw %%cx, 4(%%di)
+movw %%bx, 6(%%di)
+addw $8, %%si
+addw $8, -8(%%bp)    # wait addw imm, mem ok
+incw -4(%%bp)
+movw %[n], %%ax
+cmpw %%ax, -4(%%bp)
+jl inner
+```
+
+After inner: inc i, recompute row base: we can compute A row base at outer start into si, but si evolves +8 per j; at outer end reset. Compute at outer start: si = A + i*n*8. i*n: via mulw. Then also y base: -8(bp) = y_1 pointer (movw %[y_1], store). j=0.
+
+Outer loop overhead fine.
+
+Second kernel (x2): same but A accessed by column: A ptr starts at A + i*8, advance by stride n*8 each j. Put stride in a local -8? We already use -8 for y ptr; add another local -10 for stride. Reserve 12 bytes: -2 i, -4 j, -6 xptr(not needed since di), -8 yptr, -10 stride. Or reuse a subw $12.
+
+Second loop:
+```
+movw $0, -2(bp)  # i
+outer2:
+ if i>=n done
+ di = x2 + i*8
+ si = A + i*8      # column base
+ -8(bp) = y_2 base  # y ptr
+ j=0
+ inner2:
+   if j>=n exit
+   bx = -8(bp)
+   push y2[j] ...
+   push A[si] ...
+   call mul, add, store to di
+   addw -10(%%bp), %%si   # stride
+   addw $8, -8(bp)
+   inc j; jmp cmp
+ i++
+```
+
+Stride compute: n*8: movw %[n], %%ax; shlw $1 x3; store -10(bp).
+
+Edge: signed 16-bit: n*8 for n=2000 =16000 fits signed? 2000*8=16000 < 32767 ok. n*n*8 for n=... small model forces small arrays anyway.
+
+But wait: A is N*N doubles; with N=2000 that's 32MB — impossible under small model, so harness must use tiny n. Good.
+
+Also, what about `__muldf3` name malign: some libgcc versions for ia16 (fp-bit) export `__muldf3`; yes.
+
+Now also float branch:
+
+```
+# si=A ptr(+4), y ptr -8(bp), di=x ptr
+push from y (2 words), push from A (2 words): order b then a:
+movw -8(bp), bx
+pushw 2(bx)
+pushw (bx)
+pushw 2(si)
+pushw (si)
+call __mulsf3
+addw $8, %%sp
+# result dx:ax ; b push: push dx; push ax ; a: push 2(di); push (di)
+pushw %%dx
+pushw %%ax
+pushw 2(%%di)
+pushw (%%di)
+call __addsf3
+addw $8, %%sp
+movw %%ax, (%%di)
+movw %%dx, 2(%%di)
+addw $4, %%si
+addw $4, -8(bp)
+inc j...
+```
+
+Concern: `addw $16, %%sp` fine.
+
+One more concern: Does __muldf3 follow standard caller-cleans and clobbers only ax-dx? Since libgcc compiled with same gcc ABI: caller-saved = ax,cx,dx? and bx? If bx is callee-saved in ia16 ABI, then 64-bit return in ax:dx:cx:bx conflicts as discussed... Let me really pin down ia16-elf-gcc ABI. Let me recall gcc-ia16's i386.h modifications: In tkchia gcc-ia16 branch, config/i386/i386.h has:
+
+```
+#if TARGET_16BIT
+#define FIRST_PSEUDO_REGISTER ...
+#define FIXED_REGISTERS ... {ax,dx,cx,bx,si,di,bp,sp} fixed? none
+#define CALL_USED_REGISTERS {1,1,1,1,0,0,0?,1,...}
+```
+
+I believe CALL_USED: ax=1,dx=1,cx=1,bx=1, si=0,di=0,bp=1?(bp special),sp=1. And general regs class for ia16 excludes si/di? Actually gcc-ia16: "Registers ax, bx, cx and dx are caller-saved (clobbered by function calls); si and di are callee-saved." This matches my plan (only si/di persist across calls). Return: I've seen in issues/tweets: "ia16-elf-gcc returns long long in ax:dx:cx:bx". Ok proceeding.
+
+However! There's nuance: older gcc-ia16 returned 64-bit via memory? We've chosen to trust ax:dx:cx:bx. Risk accepted; it's the most documented.
+
+Also verify argument-passing purely on stack yes.
+
+Now potential issue: The C standard allows double rounding subtleties with libgcc fp routines deterministic — same as reference compiled code, since reference also calls __muldf3/__adddf3 in same order: inner does t = A[i][j] * y_1[j]; x1[i] = x1[i] + t. Order of ops identical. 
+
+But wait: does the compiled reference store x1[i] in memory each iteration or keep in register? With -O? The reference C compile may optimize: sum accumulate in register then store once? It can't keep 64-bit sum across calls to __muldf3 since all scratch regs clobbered... sum could live in si/di/redzone? Compiled code from gcc keeps sum on stack local. Anyway the arithmetic sequence of __adddf3 calls is identical regardless. Good.
+
+Now also must double-check int branch sematics vs reference: int multiply `imul` low 16 matches C int (wrapping, implementation-defined but gcc wraps). Division? None. Good. Only N*n etc.
+
+Now verify the int branch had another subtlety: previous attempt used `mulw %[n]` where n as memory unsigned mul; i*n fits 16 bits. fine.
+
+Also the previous-int branch: within inner loop, `pushw %%dx; imulw (%%si); popw %%dx` — imul clobbers dx; saved. Then `addw (%%di), %%ax; movw %%ax, (%%di)`. Good.
+
+Also j in cx, i in dx across inner loop (no calls in int branch) fine.
+
+Now ensure no 32-bit regs, no FPU. Also `shlw $1` allowed (encoded D1 /4). The earlier attempt assembled fine with these, keep.
+
+Another subtlety: In double branch, after `call __muldf3`, assume sp restored by addw $16. Then pushes for add call; stack fine.
+
+Alignment: none needed.
+
+Now labels: use numeric local labels (0:,1:,...) reused; ensure within same asm string they resolve to nearest—they're fine as multiple definitions of numeric labels allowed.
+
+But careful: we have three preprocessor branches each with numeric labels 0..7 etc. Since only one branch is compiled, duplicates across branches don't matter. Within a branch, numeric labels can repeat (they do: 0:,1:...7: distinct once each). Use them.
+
+However, our double/float sections need labels for two outer+inner loops: labels 0 (outer1),1(inner1),2(after inner1 continue?),3(done1),4(outer2),5(inner2),6,7(done2). Design:
+
+Branch double:
+
+```
+# prologue
+pushw %%bp
+movw %%sp, %%bp
+subw $12, %%sp
+# stride -10(bp) = n*8
+movw %[n], %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+movw %%ax, -10(%%bp)
+# i=0
+movw $0, -2(%%bp)
+0:
+movw %[n], %%ax
+cmpw %%ax, -2(%%bp)
+jge 3f
+# di = x1 + i*8
+movw %[x1], %%di
+movw -2(%%bp), %%ax
+shlw x3 → ax *= 8 (three shlw $1)
+addw %%ax, %%di
+# si = A + i*n*8
+movw -2(%%bp), %%cx    # save i
+movw -2(%%bp), %%ax
+mulw %[n]              # dx:ax = i*n
+# ax = low; *8:
+shlw $1,%%ax ... x3
+addw %[A], %%ax
+movw %%ax, %%si
+movw %%cx, ??? 
+```
+
+Wait we destroyed... i remains in memory -2(bp), so no need save. Just recompute. Simplify: use ax only.
+
+```
+# si row base:
+movw -2(%%bp), %%ax
+mulw %[n]           # AX=i*n (dx clobbered, don't care)
+shlw $1,%%ax ; x3
+addw %[A], %%ax
+movw %%ax, %%si
+# y ptr init
+movw %[y_1], %%bx
+movw %%bx, -8(%%bp)
+# j=0
+movw $0, -4(%%bp)
+1:
+movw %[n], %%ax
+cmpw %%ax, -4(%%bp)
+jge 2f
+movw -8(%%bp), %%bx
+pushw 6(%%bx)
+pushw 4(%%bx)
+pushw 2(%%bx)
+pushw (%%bx)
+pushw 6(%%si)
+pushw 4(%%si)
+pushw 2(%%si)
+pushw (%%si)
+call __muldf3
+addw $16, %%sp
+pushw %%bx
+pushw %%cx
+pushw %%dx
+pushw %%ax
+pushw 6(%%di)
+pushw 4(%%di)
+pushw 2(%%di)
+pushw (%%di)
+call __adddf3
+addw $16, %%sp
+movw %%ax, (%%di)
+movw %%dx, 2(%%di)
+movw %%cx, 4(%%di)
+movw %%bx, 6(%%di)
+addw $8, %%si
+addw $8, -8(%%bp)
+incw -4(%%bp)
+jmp 1b
+2:
+incw -2(%%bp)
+jmp 0b
+3:
+# loop2: i=0
+movw $0, -2(%%bp)
+4:
+movw %[n], %%ax
+cmpw %%ax, -2(%%bp)
+jge 7f
+movw %[x2], %%di
+movw -2(%%bp), %%ax
+shlw $1 x3
+addw %%ax, %%di
+# si = A + i*8
+movw -2(%%bp), %%ax
+shlw x3
+addw %[A], %%ax
+movw %%ax, %%si
+movw %[y_2], %%bx
+movw %%bx, -8(%%bp)
+movw $0, -4(%%bp)
+5:
+movw %[n], %%ax
+cmpw %%ax, -4(%%bp)
+jge 6f
+movw -8(%%bp), %%bx
+pushw 6(%%bx)...
+push A...
+call muldf3 ; add sp
+push result, push x; call adddf3
+store di
+addw -10(%%bp), %%si     # stride
+addw $8, -8(%%bp)
+incw -4(%%bp)
+jmp 5b
+6:
+incw -2(%%bp)
+jmp 4b
+7:
+# epilogue
+addw $12, %%sp   # or movw %%bp,%%sp; popw %%bp
+popw %%bp
+```
+
+Careful with epilogue: `movw %%bp, %%sp; popw %%bp`. Use explicit.
+
+Check `movw $0, -2(%%bp)` — gas AT&T: `movw $0, -2(%bp)` valid (imm to mem). Yes.
+
+`cmpw %%ax, -4(%%bp)` valid (reg, mem). AT&T operand size from w suffix fine.
+
+`addw $8, -8(%%bp)` imm to mem valid.
+
+`incw -4(%%bp)` valid.
+
+`pushw 6(%%bx)` mem push valid (push r/m16 is 8086). `popw` unused. `call __muldf3` — near call, assembler reloc fine. In AT&T: `call __muldf3`.
+
+Now for float branch analogous with 4-byte types: replace offsets: elements at 0/2; pushes 2(reg),(reg); addw $8 sp after calls (2 floats = 4 words). pointers +4 via shlw x2. dx:ax return: push dx, ax for b; push 2(di),(di) for a.
+
+Int branch: keep previous but swap pb_n compares to n, and drop pb_n operand. Also previous int inner had cx as j and dx as i (no calls, fine). Wait in int branch, after `mulw %[n]`, dx clobbered (we saved i in cx then moved back: sequence was: movw %%dx,%%cx; movw %%dx,%%ax; mulw; movw %%cx,%%dx). Good.
+
+But note in int branch outer loop, after computing row base into bx, cx reused as j counter (xorw cx). i stays dx. Inner uses: bx A ptr, si y ptr, di x ptr, cx j, dx i — plus ax temp, and imul clobbers dx -> saved/pushed. All good, no calls.
+
+Hmm: in int branch `shlw $1, %%ax` for i*2 (sizeof int=2). good.
+
+Also int: x offsets: `movw %[x1], %%di; movw %%dx,%%ax; shlw $1; addw %%ax,%%di`.
+
+Now double branch shift i*8: three shlw $1. row base: i*n then *8; note i*n via mulw memory: `mulw %[n]` — unsigned mul mem. Fine.
+
+Potential assembler nuance: `mulw %[n]` where %[n] expands to like `6(%bp)` — fine.
+
+One more check: comparing with `cmpw %[pb_n]` replaced everywhere by loading into ax! Can't `cmpw %[n], -4(%bp)` (both mem). So always `movw %[n], %%ax` then `cmpw %%ax, ...`. In int branch previously `cmpw %[n], %%dx` — one mem one reg is allowed! So keep direct `cmpw %[n], %%dx`. Good (mem as source). Direction: cmp src=n, dst=dx(i): sets flags i-n; jge when i>=n signed. Correct as before.
+
+Now wait: there's another potential impossible-constraint: `[A] "m" (A)` etc all variables: fine.
+
+Now, is `double` actually 8 bytes on ia16-elf-gcc? Yes (IEEE 754 binary64 soft). float 4 bytes? ia16-elf-gcc float is 32-bit IEEE single — yes.
+
+Potential issue: gcc-ia16 may use `__muldc3`? no that's complex. For multiplications of doubles it's __muldf3. Soft-fp from libgcc "soft-fp" for i386? ia16 libgcc likely uses "config/soft-fp" with 32-bit? There is possibility libgcc functions assume 32-bit regs? No—they're compiled C.
+
+Alternatively maybe ia16 gcc uses fp-bit.c where functions are `__muldf3` too (with _fpname). Standard names hold.
+
+But hold on: does ia16-elf-gcc even link libgcc float routines by default for soft double ops? If a program uses double arithmetic, it requires __adddf3 etc. from libgcc — gcc links automatically. Since reference C kernel does the same, linking succeeds.
+
+Edge: The float branch: DATA_TYPE_IS_FLOAT. The else branch = double. If harness used INT, else branch never compiled. To be safe implement all three as described.
+
+Now, about `subw $12, %%sp` and calls: fine.
+
+One concern: In the float/double branches we destroy bp (frame pointer). The function uses frame pointer? We push/restore bp; but inline asm with "memory" clobber and our own bp usage: gcc doesn't know we clobber bp, but since we restore it exactly, fine. We should not list bp in clobbers (gcc reserves). We restore it, so no issue.
+
+Also our asm is __volatile__; keep volatile.
+
+Now numeric labels vs local labels and jumps referencing across many lines — fine.
+
+Also `jge`/`jl`: 8086 conditional jumps are short (±127). Our inner loop body for double is long (~30 instructions, but each short; total bytes maybe > 127?). Inner loop from label 1: to `jmp 1b` at end: body length: pushes (2 bytes each?) pushw mem = 2-3 bytes. 8 pushes ≈ 8*3=24 bytes, call=3, addw=4, push regs 4 bytes (1 each=4), push mem 12, call 3, add 4, mov stores 4*3=12, addw si 4? addw $8,%si = 4 bytes, addw mem imm = 5 bytes, incw mem=3, jmp=2, movw mem,ax for cmp at top 4, cmp 3, jge 2. Total ≈ 100? Could be near/above 127 for jge 2f? Distance from jge (near top) forward to label 2 is small (2 bytes). The backward jge? Structure:
+
+```
+1:
+ cmp...        # ~7 bytes
+ jge 2f        # 2 bytes (forward short distance ~0)
+ body ~90 bytes
+ jmp 1b        # backward ~95 bytes fine (<128?)
+```
+
+Backward jmp 1b distance ~90-100 < 127 ok. Outer loop `jmp 0b` backward distance includes whole inner + setup: huge (hundreds bytes) — `jmp` near (16-bit displacement on 8086: unconditional near JMP rel16 exists: opcode E9 cw) — yes 8086 has near jmp rel16, so any distance ok. Conditional jge/jl are SHORT only ±127! `jge 3f` from outer-compare forward to done label? distance: from compare position to label 3 is the rest of outer iteration (huge, >127) — problem! In branch exit direction, jge 3f jumps forward over entire outer body. That's >127 bytes → assembler error "out of range".
+
+Solution: invert: at top, `cmp; jl 10f?` hmm standard pattern: 
+
+```
+0:
+ cmp
+ jge exit_via: use local jump:
+   jl 11f  (short, to body) ; jmp 3f (near) ; 11: body
+```
+
+Simpler: put condition at bottom (do-while) with pre-entry check: Before loop, jump to condition test at bottom:
+
+Standard: 
+```
+ jmp 12f
+0: body...
+12: cmp; jl 0b? 
+```
+For outer loop entry we need conditional jump with short range: put condition right before a backward jl (short) is fine distance (body could be >127! Outer body includes inner loops hundreds bytes → backward jl also out of range!).
+
+Conditional jumps range ±127 bytes — outer loops spanning hundreds of bytes can't use them at all. Handle: use pattern `jge $+...?` no. Use: 
+
+```
+# condition: if i >= n goto done (far)
+cmp
+jl 0body (short, +2)   # body continues
+jmp 3f (near, rel16)   # exit
+0body: ...
+```
+
+i.e., 
+```
+movw %[n], %%ax
+cmpw %%ax, -2(%%bp)
+jl 8f          # continue
+jmp 3f         # exit (near jmp, 16-bit displacement OK)
+8:
+<body>
+...
+jmp 0b? 
+```
+Wait label structure: outer loop label 0 at top. Use:
+
+```
+0:
+ movw %[n], %%ax
+ cmpw %%ax, -2(%%bp)
+ jl 8f
+ jmp 3f
+8:
+ <outer body>
+ jmp 0b
+3:
+```
+
+`jl 8f` short forward ~+2 (jmp is 3 bytes) fine. `jmp 3f` near forward handles long distance. `jmp 0b` near backward long ok.
+
+Inner loop: body ~? double inner body: let's estimate bytes: movw -8(bp),bx = 4 (81? "movw -8(%bx?,...)" modrm w disp8: 8B 5F F8 =3-4). pushes: pushw 6(%bx) = FF 77 06 =3 bytes each ×8 =24; call=3; addw sp=4 (83 C4 10? addw $16,%sp=3: 83 C4 10 is 3 bytes); push bx,cx,dx,ax = 1×4=4; pushw 6(di)= FF 75 06=3 ×4=12; call=3; add=3; movw ax,(di)=2 (89 05), 2(di)=3,4(di)=3,6(di)=3 → 11; addw $8,si=3? 83 C6 08=3; addw $8,-8(bp)= 83 46 F8 08 =4; incw -4(bp)= FF 46 FC=3; then loop-back condition: movw n,ax = 3? (A1? `movw %[n],%%ax` = 8B 46 disp? ~4); cmpw ax,-4(bp)= 39 46 FC=3; jl 1b? distance from here back to label1.
+
+Total inner ≈ 4+24+3+3+4+12+3+3+11+3+4+3 = 77 + compare 7 = 84. jl backward 84 <127 ✓. But safer to also split? It's fine (~84).
+
+Float inner smaller (~60). Int inner small (~25).
+
+Outer body double ≈ setup (~30) + inner (~90) + inc/jmp = ~125 + condition 7. The `jmp 0b` near backward is fine (E9 rel16). ✓. And `jmp 3f` exit near-forward fine.
+
+But wait: previously (previous attempt int branch) used `jge 3f` forward over outer body with only `jge` short jump? It compiled fine for int (small enough? outer body ~50 bytes, yes <127). For double, must use jl/jmp pattern. Also float outer body maybe ~110 <127; but use same safe pattern everywhere for consistency.
+
+Similarly inner loop condition placed at top with jge 2f forward short (only ~2 bytes to skip? no: jge 2f must skip entire inner body ~84 bytes forward → within 127 ✓ but close; keep the top-check pattern: label1: cmp; jge 2f (short, distance = body+ ~84 <127 ok). Or use jl/jmp pattern; safer: use same pattern:
+
+```
+1: cmp
+   jl 9f   # short (+3)
+   jmp 2f  # near
+9: body
+   jmp 1b  # near backward (84 <127 anyway but near handles)
+2:
+```
+
+Use near jumps liberally (jmp rel16) and conditional only for ±few bytes. Since gas converts `jge` etc to short only; long distances error. With pattern, conditional always jumps 3 bytes (over the near jmp). Safe for any size.
+
+Actually careful: `jl 9f` where 9 is immediately after the `jmp near` (3 bytes) → displacement = 3 → ok.
+
+Alternatively, avoid top check by bottom check: entry via jmp to bottom cmp. Then backward conditional jump distance = body — too long for double inner (84 ok <127; float 60 ok; int 25 ok) — all under 127 anyway! Outer body: double ~130 >127 → need jl/jmp trick only for outer loops; inner can use bottom-check with short conditional... but to be uniform and safe, use jl/jmp trick everywhere. It's simplest: every loop: head label, then `cmp`, `jl Lcont`, `jmp Ldone`, `Lcont:` body `jmp Lhead`, `Ldone:`. Conditionals always displacement 3.
+
+Now registers note: double branch: all compares load n into ax — fine.
+
+Also in double branch: we need i for computing addresses: read -2(bp) each time.
+
+Double-check `mulw %[n]` result *8 with shifts: i*n up to 40*40=1600? wait i≤n-1=39 → i*n ≤ 39*40=1560, *8=12480 < 32767 ✓. For n≤90 fits. n*8 stride ≤ 720.
+
+Float/double base addresses: A + offset; near pointer arithmetic 16-bit fine in small model as array < 64KB. POLYBENCH arrays might be allocated with polybench_alloc_data → aligned malloc; small model near heap <64KB total. N=40: A=40*40*8=12800 bytes fine.
+
+Now also confirm double representation little-endian word order: value stored low word first (x86 little endian): at (addr) bits0-15, +2 bits16-31, +4 bits32-47, +6 bits48-63. Return ax=low...matches layout: store ax at 0, dx at 2, cx at 4, bx at 6. For pushing an argument double a: we push w3,w2,w1,w0 so that [sp]=w0 (low) — using pushw 6(ptr) first, then 4, 2, 0. ✓ For pushing register result {ax,dx,cx,bx} (ax low): push bx (w3), cx (w2), dx (w1), ax (w0): pushw %%bx; pushw %%cx; pushw %%dx; pushw %%ax → [sp]=ax ✓.
+
+Float: dx:ax (ax low). Push arg float from mem: pushw 2(p); pushw (p). b first then a. Result push for b: pushw %%dx; pushw %%ax. Store: (di)=ax, 2(di)=dx ✓.
+
+Caller-cleanup: addw $16 / $8 ✓.
+
+Now verify which is arg a vs b for __muldf3(a,b): multiplication commutative so order irrelevant; addition commutative too. So even if we swapped a/b, results identical. Nice—removes one risk.
+
+Return reg order risk remains (ax:dx:cx:bx low..high vs other permutations). I'm fairly confident: ia16 unknown... Let me try to recall actual gcc-ia16 source: config/i386/i386.h in tkchia/gcc-ia16 has:
+
+```
+#define FUNCTION_VALUE(VALTYPE, FUNC) \
+  gen_rtx_REG (TYPE_MODE (VALTYPE), FIRST_VALUE_REGNO)
+```
+Hmm not exactly. Let me recall from known examples: There's a blog post "Fun with GCC and DOS" showing:
+
+For code returning `long long`, e.g.:
+```
+unsigned long long foo(void) { ... ret in ax dx cx bx ... }
+```
+I remember Dave Mummer/issue mentioning `long long` returns in AX:DX:CX:BX for ia16. I'll trust.
+
+Additional safety: instead of relying on return registers, we could use library routines that store via pointer—none for basic ops.
+
+Alternative verification trick: We could call __muldf3 and __adddf3 as the C compiler would; if return convention wrong, output wrong and benchmark fails. Accept the best-known convention.
+
+Hmm, wait. Actually there might be another possibility: gcc-ia16 config defines `TARGET_RETURN_IN_MEMORY` for anything > 4 bytes? Let me think about i386 original: returns DI mode in edx:eax (not memory) — hard-coded. ia16 inherits; DI mode reg = regs 0..3. So ax,dx,cx,bx. Also long double (12/16 bytes) returned in memory. Double (8 bytes / DI) in regs. float (SF, 4 bytes): two regs 0,1 = ax,dx → dx:ax convention as we assumed (low in ax). Standard ia16 32-bit returns are dx:ax (e.g., long, pointer-far). float same. ✓.
+
+Now, also need to ensure we preserve si/di/bp across... our own code uses si,di freely — declared clobbers include si, di, memory, cc, ax,bx,cx,dx — good, bp not listed (we restore).
+
+Wait: clobber list includes "bx" etc. Fine.
+
+One more: `subw $12, %%sp` then calls — the locals at -2..-10(bp) are below bp, above sp? After sub, sp = bp-12; locals -2,-4,-8,-10 within [bp-10, bp-2], i.e., above sp ✓; pushes during calls temporarily go below sp, that's normal (call frame below our locals) ✓.
+
+Now the integer branch — also should we test if DATA_TYPE_IS_INT is what attempt0 used? It errored only on constraint; our fix uses only n — fine.
+
+Also, maybe simpler to unify: The harness clearly compiled float or double branch (FPU errors). Implement both robustly.
+
+Also epilogue restore: `movw %%bp, %%sp` then `popw %%bp` — but note at end sp = bp-12 → movw bp,sp restores sp to where bp saved... then popw bp ✓.
+
+Edge: `pushw %%bp` at start; compiler also declared cc/memory clobbers; asm volatile prevents deletion.
+
+Label numbering inside one asm string: Gas numeric labels can repeat; our branch has labels 0..9 unique sequence; using 8/9 as continuation labels:
+
+Loops pattern for double branch:
+
+```
+movw $0, -2(%%bp)      # i=0  (loop1)
+0:
+movw %[n], %%ax
+cmpw %%ax, -2(%%bp)
+jl 8f
+jmp 9f
+8:
+# setup di, si, -8, j=0
+...
+movw $0, -4(%%bp)
+1:
+movw %[n], %%ax
+cmpw %%ax, -4(%%bp)
+jl 6f
+jmp 7f
+6:
+# inner body
+...
+incw -4(%%bp)
+jmp 1b
+7:
+incw -2(%%bp)
+jmp 0b
+9:
+# loop2
+movw $0, -2(%%bp)
+2:
+movw %[n], %%ax
+cmpw %%ax, -2(%%bp)
+jl 8f       # careful: numeric label 8 already used behind; '8f' forward finds next one — define another 8 later. Numeric labels may be reused.
+jmp 9f
+8:
+...
+movw $0, -4(%%bp)
+3:
+movw %[n], %%ax
+cmpw %%ax, -4(%%bp)
+jl 6f
+jmp 7f
+6:
+...
+incw -4(%%bp)
+jmp 3b
+7:
+incw -2(%%bp)
+jmp 2b
+9:
+movw %%bp, %%sp
+popw %%bp
+```
+
+Numeric label reuse: `jl 8f` jumps to next 8 forward — after defining 8 again later, fine. `jmp 9f` — next 9 forward ✓. Same for 6/7. Works in gas.
+
+Now int branch previous code used labels 0..7 with forward jge over outer body — int outer body bytes: row setup ~ (mov di 3? "movw %[x1],%%di" = 3B? approx 4), i*2 ~6, rowbase: mov,mov,mul,shl,shl,add,mov ~ 4+3+3? etc ~25, inner body: cmp(3)+jge(2)+mov si(4)+mov(3)+shl(2)+add(2)+mov(2)+push(1)+imul(3)+pop(1)+add(3)+mov(2)+add(2)+inc(1)+jmp(2)=~31 + outer tail inc+jmp=3 → total ~65 <127, so simple jge forward fine for int — previous attempt compiled? attempt1 errors were only FPU lines, so int branch (if selected) presumably passed. Keep int branch structurally as before (with pb_n→n). But wait — attempt1 line numbers 116-119 for FPU: the selected branch in attempt1 was FLOAT (flds...) or DOUBLE (first FPU at double branch line ~116?). Error says mnemonics `fld,fmul,fadd,fstp` — both branches map same. Whichever; fix both anyway.
+
+Also for float branch: address scaling i*4: two shlw $1. ✓ stride n*4 two shls.
+
+Also float/double branch "shlw $1" three times for *8 or two for *4 — fine.
+
+Additional check: `mulw %[n]` in double loop for row base; but also we need i*8 for x pointer and column base: computed with shlw from -2(bp) load. ✓.
+
+Second loop (x2): A[j][i]: si = A + i*8; per j: si += n*8 (stride). y_2[j]: ptr in -8(bp) init y_2. Same call sequence; x = x2[i] in di.
+
+Now, sizes for `cmpw` signedness: i, n positive < 32768 ✓.
+
+Potential problem: `movw $0, -2(%%bp)` when bp-based with negative disp — `movw $0, -2(%bp)` gas fine: C7 46 FE 0000.
+
+Also, `subw $12, %%sp` then before calls: total locals 12 bytes: -2 i, -4 j, -8 yptr, -10 stride (using -2,-4,-8,-10; -12 unused → could subw $10 but keep 12 for alignment-irrelevant).
+
+Wait I use -6? No: locals: i=-2, j=-4, yptr=-8, stride=-10. -6 unused. Fine.
+
+Let me now also double-check the int branch for correctness vs original: it accumulates x1[i] += A[i][j]*y1[j] with int wrapping; original C: x1[i] = x1[i] + A[i][j]*y_1[j]; int mult overflow UB but gcc generates wraparound imul/mul low — matches.
+
+Also check prior int version's outer handling: previous sequence:
+
+```
+"xorw %%dx, %%dx\n"            # i = 0
+"0: cmpw %[n], %%dx; jge 3f"
+# di = x1 + i*2
+"movw %[x1], %%di"
+"movw %%dx, %%ax"
+"shlw $1, %%ax"
+"addw %%ax, %%di"
+# row base: si? previous used bx:
+"movw %%dx, %%cx"
+"movw %%dx, %%ax"
+"mulw %[n]"
+"movw %%cx, %%dx"
+"shlw $1, %%ax"
+"addw %[A], %%ax"
+"movw %%ax, %%bx"
+"xorw %%cx, %%cx"
+"1: cmpw %[n], %%cx; jge 2f"
+"movw %[y_1], %%si"
+"movw %%cx, %%ax"
+"shlw $1, %%ax"
+"addw %%ax, %%si"
+"movw (%%bx), %%ax"
+"pushw %%dx"
+"imulw (%%si)"
+"popw %%dx"
+"addw (%%di), %%ax"
+"movw %%ax, (%%di)"
+"addw $2, %%bx"
+"incw %%cx"
+"jmp 1b"
+"2: incw %%dx; jmp 0b"
+"3: ..."
+```
+
+That's correct. Second loop: x2[i] += A[j][i]*y2[j]: di = x2+i*2, bx = A + i*2 (column), advance bx += 2*n each j. y2 ptr si. ✓ previous had `movw %[n],%%ax; shlw $1; addw %%ax,%%bx`. ✓.
+
+Note int outer forward `jge 3f` from near top: distance ~65 ✓ compiled before apparently (no error reported for int branch? errors listed only 'impossible constraint' at attempt0 line 87 and FPU at attempt1 lines 116-119. If attempt0 (int?) failed on constraint before assembling the body; after fix, int body should assemble; distances fine).
+
+Hmm wait: 'impossible constraint' is a compile-time (gcc) error, not assembler. It occurred at line 87 which is the __asm__ start in attempt0 file. attempt1 apparently had a modified version where constraint was fixed? But shown PREVIOUS_ASM has pb_n "m" operand and got both errors? Confusing dedup across two attempts. Anyway our fix addresses both.
+
+Now, what if in this build the selected branch is FLOAT: float FPU instructions flds/fmuls/... were used previously → errors match `fld,fmul,fadd,fstp`. If DOUBLE selected: fldl etc → same mnemonics. Implement both as soft-fp libcalls.
+
+Double-check float libcall names: __mulsf3, __addsf3 ✓.
+
+Possible concern: calls inside asm to functions might need `call __muldf3` with %? no.
+
+Also PLT/relocations: static linking, near call rel16 R_386_PC16? i386 gas for ia16 handles `call sym` as pc-relative 16 — fine.
+
+Now also need to ensure assembler accepts `addw $16, %%sp` etc ✓.
+
+Let me also consider: maybe ia16-elf-gcc passes some args in registers for libcalls? No—gcc generates calls with stack args; libgcc functions compiled under same ABI. When *we* call them, mimic stack passing. But wait: does gcc-ia16 have a special convention for __mulsi3 etc. (they do: __mulsi3 takes dx:ax?), but for float/double ops, gcc emits normal libcalls with standard ABI (per i386.md `define_expand muldf3` → gen call to `__muldf3` with operands in... on i386, uses `ix86_expand_binop_builtin`? These libcalls pass args... on i386 32-bit ABI, doubles passed on stack ✓ (regparm not default). ia16: stack ✓).
+
+Actually hold on: i386 gcc for soft-float emits calls to __muldf3 etc. via `gen_libcall` which passes args per ABI: memory/stack ✓. So mirroring stack calling is right.
+
+Let me now write the full asm carefully.
+
+Also note: y_1 operand name `[y_1]` — fine (asm operand names can have underscore+ digit? The name `y_1` is fine).
+
+One more consideration: The function is static; inline asm inside kernel_mvt; symbols __muldf3 visible at link ✓.
+
+Also since we use helper calls, this is ia16 specific — acceptable.
+
+Now decide sub-structure per branch to minimize label count confusion; write each branch fully.
+
+Let me also double check the prologue: we clobber bp in our code; we listed clobbers without bp but we save/restore it—fine. But gcc might have variables in frame accessed via bp saved in... our pushes below bp don't affect them ✓.
+
+Also "memory" clobber included ✓ (we modify array contents and call functions).
+
+Write double branch:
+
+```
+pushw %%bp
+movw %%sp, %%bp
+subw $12, %%sp
+movw %[n], %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+movw %%ax, -10(%%bp)
+movw $0, -2(%%bp)
+0:
+movw %[n], %%ax
+cmpw %%ax, -2(%%bp)
+jl 8f
+jmp 9f
+8:
+movw %[x1], %%di
+movw -2(%%bp), %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+addw %%ax, %%di
+movw -2(%%bp), %%ax
+mulw %[n]
+shlw $1, %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+addw %[A], %%ax
+movw %%ax, %%si
+movw %[y_1], %%ax
+movw %%ax, -8(%%bp)
+movw $0, -4(%%bp)
+1:
+movw %[n], %%ax
+cmpw %%ax, -4(%%bp)
+jl 6f
+jmp 7f
+6:
+movw -8(%%bp), %%bx
+pushw 6(%%bx)
+pushw 4(%%bx)
+pushw 2(%%bx)
+pushw (%%bx)
+pushw 6(%%si)
+pushw 4(%%si)
+pushw 2(%%si)
+pushw (%%si)
+call __muldf3
+addw $16, %%sp
+pushw %%bx
+pushw %%cx
+pushw %%dx
+pushw %%ax
+pushw 6(%%di)
+pushw 4(%%di)
+pushw 2(%%di)
+pushw (%%di)
+call __adddf3
+addw $16, %%sp
+movw %%ax, (%%di)
+movw %%dx, 2(%%di)
+movw %%cx, 4(%%di)
+movw %%bx, 6(%%di)
+addw $8, %%si
+addw $8, -8(%%bp)
+incw -4(%%bp)
+jmp 1b
+7:
+incw -2(%%bp)
+jmp 0b
+9:
+movw $0, -2(%%bp)
+2:
+movw %[n], %%ax
+cmpw %%ax, -2(%%bp)
+jl 8f
+jmp 9f
+8:
+movw %[x2], %%di
+movw -2(%%bp), %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+addw %%ax, %%di
+movw -2(%%bp), %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+addw %[A], %%ax
+movw %%ax, %%si
+movw %[y_2], %%ax
+movw %%ax, -8(%%bp)
+movw $0, -4(%%bp)
+3:
+movw %[n], %%ax
+cmpw %%ax, -4(%%bp)
+jl 6f
+jmp 7f
+6:
+movw -8(%%bp), %%bx
+pushw 6(%%bx)
+pushw 4(%%bx)
+pushw 2(%%bx)
+pushw (%%bx)
+pushw 6(%%si)
+pushw 4(%%si)
+pushw 2(%%si)
+pushw (%%si)
+call __muldf3
+addw $16, %%sp
+pushw %%bx
+pushw %%cx
+pushw %%dx
+pushw %%ax
+pushw 6(%%di)
+pushw 4(%%di)
+pushw 2(%%di)
+pushw (%%di)
+call __adddf3
+addw $16, %%sp
+movw %%ax, (%%di)
+movw %%dx, 2(%%di)
+movw %%cx, 4(%%di)
+movw %%bx, 6(%%di)
+addw -10(%%bp), %%si
+addw $8, -8(%%bp)
+incw -4(%%bp)
+jmp 3b
+7:
+incw -2(%%bp)
+jmp 2b
+9:
+movw %%bp, %%sp
+popw %%bp
+```
+
+Check label reuse legality: `jl 8f / jmp 9f ... 8: ... 9:` then later `jl 8f` again — next 8 forward is the second 8 ✓. Backward refs `jmp 0b`,`jmp 1b` — nearest backward ✓ (0 defined once, 1 once, 2,3 once; 6,7 reused but each back-reference `jmp 1b`/`jmp 3b` targets nearest behind ✓; forward `jl 6f`/`jmp 7f` nearest ahead ✓).
+
+Byte-range check: all conditionals jump 3 bytes forward ✓.
+
+Also check `mulw %[n]` clobbers dx — we don't hold anything in dx there ✓.
+
+Float branch analogous with 4-byte, __mulsf3/__addsf3, results dx:ax, stride n*4, stores 2 regs, sp adjust 8, cond jump pattern same, offsets push: `pushw 2(%%bx); pushw (%%bx)`.
+
+Double-check float store: `movw %%ax, (%%di); movw %%dx, 2(%%di)` ✓.
+
+Float mul arg push sequence (b then a), each: w1 then w0 ✓.
+
+Float result push for add: push dx then ax ✓.
+
+Int branch: keep original structure (labels 0-7) with pb_n→n and no numeric duplication across branch boundaries issues — each #if branch separate compilation ✓... wait: the #if/#elif/#else blocks are inside ONE asm string? No—preprocessor lines inside the arg list of __asm__: the previous attempt had `#if ...` between string segments, selecting which strings to concatenate. Since cpp runs on the file, only selected branch's strings remain ✓. Keep that design.
+
+But hmm: what if the harness compiles with DATA_TYPE_IS_INT and ALSO links without libgcc float — our int branch references no float symbols ✓ (preprocessor removes others). Good—important that calls to __muldf3 only appear in the compiled branch; otherwise undefined references on int build? libgcc always linked so fine anyway.
+
+Also operand list: remove `[pb_n]`. Ensure no string references %[pb_n] remain.
+
+Now, int branch keep using `cmpw %[n]` as before.
+
+Also, one subtle thing: previous int code, label flow: outer `jge 3f` distance ~65 fine; inner `jge 2f` ~25 fine.
+
+I should double check `imulw (%%si)` gas syntax for AT&T mem operand: `imulw (%si)` → accepted (one-operand imul r/m16). ✓ previously presumably assembled? attempt0 never assembled due to gcc error at line 87 — so int branch assembly not verified! Let's verify all int instructions against 8086:
+
+- xorw, cmpw mem, jge short, movw, shlw $1 (D1 4 /4: shift by 1 — 8086 ok; gas may encode with count in opcode D1 not C1; fine), addw, mulw mem (F7 /4? mul r/m16 one-op, 8086 ✓), imulw mem (F7 /7? Actually IMUL = F7 /7? MUL /4, IMUL /7? No: F7 /4 = MUL, /7? IMUL is F7 /7? Hmm: opcodes: /4 MUL, /5 IMUL, /7 IDIV? Let's recall: F7: /0 TEST, /2 NOT, /3 NEG, /4 MUL, /5 IMUL, /6 DIV, /7 IDIV. Yes IMUL /5 ✓ 8086), pushw reg (50+r ✓), popw reg ✓, addw mem,reg ✓, movw reg,mem ✓, addw $2,%%bx (83 C3 02 ✓), incw reg ✓, jmp near ✓, jge ✓.
+
+Also `shlw $1, %%ax` — on 8086, shifting by immediate 1 uses D1 form which gas emits; not C1 ✓.
+
+Edge: Are labels numeric colliding with the numeric local labels potentially used by surrounding gcc-generated code? Numeric labels are file-local in gas; gcc doesn't emit numeric labels(uses .L). Our asm string shares the assembly file with generated code but numeric labels scoped by nearest ref ✓.
+
+Now, also guard: in double/float branch, we used `mulw %[n]` (memory). i*n *8 vs overflow: for n up to 127, i*n ≤ 126*127=16002; *8=128016 > 65535 overflow 16-bit pointer math — but array would be 128KB > 64KB small-model segment — impossible. For float n up to ~127: n*n*4 ≤ 64k → n≤127, i*n*4 ≤ 64516 borderline. Unsigned 16-bit mul low word is consistent with pointer arithmetic C does anyway (offsets mod 2^16 in near ptr). C compiler would use similar 16-bit IMUL — same wrap. So OK.
+
+Now, does the second loop's column advance `addw -10(%%bp), %%si` (stride word) match C pointer arithmetic? C: A[j][i] with A as 2D → address = base + (j*n+i)*el — yes cumulative stride addition gives (j*n+i)*el incrementally ✓ (mod 2^16, same as C near pointer).
+
+I think good. But one more ABI nuance: are floats/doubles passed on stack aligned/padded? Each double arg = 8 bytes ✓; float 4 bytes ✓. No padding on ia16 for 8-byte args (alignment 2). ✓.
+
+What about the stack arg order sanity: after `call __muldf3`, inside callee [sp+2] = arg0 low word. We pushed b then a; at call, [sp]=a low ✓ callee sees arg0 at sp+2 ✓.
+
+Now: does ia16-elf-gcc use register-based "regparm" default? No.
+
+Also do we need `.extern`? No, calls to extern symbol auto.
+
+Now also consider whether assembler supports `movw $0, -2(%%bp)` — sure.
+
+Formatting: The output must be ONLY the replacement region: one complete asm() block, no comments, no markdown. Keep #if/#elif preprocessor? The previous attempt used them; it's still returning only the asm block with cpp directives. That's acceptable ("the assembly you wrote is between markers" included them). Keep them to preserve int fast path. Hmm—but do we know the harness defines DATA_TYPE_IS_*? mvt.h itself defines DATA_TYPE_IS_DOUBLE by default if none specified (PolyBench 4.x behavior). So else-branch = double triggers by default; good. If harness defines INT, int branch; FLOAT → float.
+
+Also note potential gotcha: in mvt.h, when DATA_TYPE_IS_INT defined, DATA_TYPE=int, and _PB_N maybe... fine.
+
+One more check on int branch: `mulw %[n]` result DX:AX; we only need AX. But careful: mulw sets DX=high remainder? DX:AX product; then we `movw %%cx, %%dx` restore i — we had saved i to cx before mul ✓ then set cx=0 as j. Order in previous code: 
+
+```
+movw %%dx, %%cx
+movw %%dx, %%ax
+mulw %[n]
+movw %%cx, %%dx     # restore i
+shlw $1, %%ax
+addw %[A], %%ax
+movw %%ax, %%bx
+xorw %%cx, %%cx     # j=0
+```
+✓.
+
+Second loop int (previous): 
+```
+xorw %%dx, %%dx
+4: cmp n, dx; jge 7f
+movw %[x2], %%di
+movw %%dx, %%ax; shlw; addw ax, di
+movw %[A], %%bx
+movw %%dx, %%ax; shlw; addw ax, bx     # column base A + i*2
+xorw %%cx, %%cx
+5: cmp n, cx; jge 6f
+movw %[y_2], %%si
+movw %%cx, %%ax; shlw; addw ax, si
+movw (bx), ax
+push dx; imulw (si); pop dx
+addw (di), ax; movw ax, (di)
+movw %[n], %%ax; shlw $1, ax; addw ax, bx   # stride 2n
+incw cx; jmp 5b
+6: incw dx; jmp 4b
+7:
+```
+✓ matches previous attempt.
+
+Outer `jge 7f` range: body ~65 ✓.
+
+Now assemble final answer: one asm block with three cpp branches. Strings with \n and tabs. Must be valid C string concatenation with #if between — exactly like previous attempt.
+
+Double branch `jl 8f` uses numeric labels 6..9 shared with int branch if int not selected no issue. Within double branch labels 0,1,2,3,6,7,8,9 (6-9 repeated twice each) — fine because refs always nearest.
+
+Let me recount forward refs in double branch for `jl 8f / jmp 9f`: first occurrence jumps to first 8/9 (correct, right ahead ~3 bytes for 8f? wait `jl 8f` jumps to label 8 which is ~3+?? Actually label 8 immediately follows the `jmp 9f` instruction: 
+
+```
+cmpw %%ax, -2(%%bp)
+jl 8f        # -> label 8 (just after jmp) — displacement = size of jmp (3 bytes) = +3
+jmp 9f       # exit
+8:           # body
+```
+✓.
+
+Second outer loop: `jl 8f` → next 8 forward (second 8) ✓; `jmp 9f` → second 9 ✓.
+
+Inner: 
+```
+1:
+cmp
+jl 6f
+jmp 7f
+6:
+<body>
+jmp 1b
+7:
+```
+✓. Reused 6/7 for second inner ✓ (`jl 6f` forward second 6 ✓).
+
+Jmp distances: `jmp 1b` near backward ~85 bytes (fine, near jmp rel16 regardless). Note: near jump backward encoded E9 cb (3 bytes) always for label references (gas may optimize to short EB if in range — either fine).
+
+Also confirm cmp operand direction: `cmpw %%ax, -2(%%bp)` → computes (-2(bp)) - ax = i - n; `jl` taken when i<n ✓ (signed).
+
+`cmpw %[n], %%dx` int: dst=dx (i) - src=n; jge when i>=n ✓.
+
+Now, also constraint: "`addw %[A], %%ax`" — add mem to reg, valid (ADD r16, m16? direction: addw src,dst: dst=ax, src=mem → 03 46 xx ADD r16,r/m16 ✓).
+
+Everything 8086-compatible. push imm not used ✓ pushw sp? not used ✓ enter/leave not used ✓.
+
+One more: `subw $12, %%sp` — imm16 sub ✓; `addw $16, %%sp` ✓ (83 C4 10 imm8 sign-extended, 8086 ok? 83 group is 8086 valid ✓).
+
+Also strings: For the preprocessor in the middle of __asm__( ... ) we must ensure commas structure: previous attempt had the three branches as adjacent string literals selected by cpp — valid ✓ (the `: :` operands after).
+
+Now, double-check float branch details complete:
+
+```
+pushw %%bp
+movw %%sp, %%bp
+subw $12, %%sp
+movw %[n], %%ax
+shlw $1, %%ax
+shlw $1, %%ax
+movw %%ax, -10(%%bp)     # stride n*4
+movw $0, -2(%%bp)
+0: cmp/jl/jmp pattern
+8:
+di = x1 + i*4 (2 shls)
+si = A + i*n*4 (mulw, 2 shls)
+-8 = y_1
+j=0
+1: cmp jl 6f jmp 7f
+6:
+movw -8(bp), bx
+pushw 2(bx); pushw (bx)
+pushw 2(si); pushw (si)
+call __mulsf3
+addw $8, %%sp
+pushw %%dx
+pushw %%ax
+pushw 2(%%di)
+pushw (%%di)
+call __addsf3
+addw $8, %%sp
+movw %%ax, (%%di)
+movw %%dx, 2(%%di)
+addw $4, %%si
+addw $4, -8(%%bp)
+incw -4(%%bp)
+jmp 1b
+7: incw -2; jmp 0b
+9: i=0 loop2 with stride from -10:
+2: ...
+8: di=x2+i*4; si=A+i*4; -8=y_2; j=0
+3: ...
+6: same calls; addw -10(bp), %%si; addw $4,-8; inc j; jmp 3b
+7: inc i; jmp 2b
+9: movw %%bp,%%sp; popw %%bp
+```
+
+✓.
+
+Also confirm we need y as arg "b" of mul: multiplication commutative; addition commutative — order irrelevant. ✓.
+
+I think that's final. Write out compactly as the previous format (string per line with \n). No comments within strings (comments would be in the asm - allowed? Requirement: no comments. Keep bare instructions).
+
+Also keep `__asm__ __volatile__` wrapper with operands: [n], [x1], [x2], [y_1], [y_2], [A], clobbers "ax","bx","cx","dx","si","di","cc","memory".
+
+Note: we also use bp but restore; not listed. Also we call functions that may clobber flags etc — covered by cc/memory. Registers the called functions change (ax-dx per convention) are clobbered ✓. If callee also clobbers si/di? callee-saved per ABI — but gcc might consider our asm clobbering si/di already listed ✓ anyway.
+
+Edge: functions may clobber bp? No (frame pointer callee-saved).
+
+Final answer formatting: exactly the asm(...) block, no prose. Preserve `#if defined(DATA_TYPE_IS_INT)` etc. between string groups — these are preprocessor lines at column 0 inside the function body; allowed.
+
+Wait: "comments" banned; cpp directives are not comments — previous attempt had them; keep.
+
+Also the operand for y_1: keep name [y_1]. Gas-side unused in int branch uses %[y_1] ✓.
+
+One tiny thing: in double branch, `movw %[y_1], %%ax; movw %%ax, -8(%%bp)` — could directly `movw %[y_1], -8(%%bp)`?? mem←mem not allowed; via ax ✓ as written.
+
+Also `addw $8, %%si` — 83 C6 08 ✓.
+
+Also `addw -10(%%bp), %%si` — add r16, m16: operand order src=mem(-10 bp), dst=si → `addw -10(%bp), %si` in AT&T = add mem to reg ✓.
+
+Double-check direction in gas AT&T: `addw src, dst`. Yes.
+
+Now craft the int branch exactly like previous but with %[n] replacing %[pb_n], remove the pb_n operand line.
+
+Write final.
