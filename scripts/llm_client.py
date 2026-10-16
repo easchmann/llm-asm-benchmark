@@ -65,6 +65,7 @@ class LlmError(Exception):
         self.cost_usd = cost_usd
         self.key_spend = key_spend
         self.elapsed_seconds = elapsed_seconds
+        self.attempts = None
 
 
 def split_scop(src):
@@ -218,6 +219,9 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         try:
             resp, status, cost, key_spend, resolved_model = run_once(attempt)
             break
+        except LlmError as e:
+            e.attempts = attempt + 1
+            raise
         except _TransientError as e:
             last_err = e.err
             if attempt < MAX_RETRIES:
@@ -227,17 +231,21 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
                 time.sleep(delay)
             # else: fall through and raise last_err after the loop
     if resp is None:
+        last_err.attempts = MAX_RETRIES + 1
         raise last_err
+    attempts = attempt + 1
 
     elapsed = round(time.time() - start, 1)
     message = resp["choices"][0]["message"]
     content = message["content"]
     finish_reason = resp["choices"][0].get("finish_reason", "unknown")
     if content is None:
-        raise LlmError(f"empty content, finish_reason={finish_reason} "
+        err = LlmError(f"empty content, finish_reason={finish_reason} "
                        "(likely hit max_tokens before finishing)",
                        usage=resp.get("usage", {}), cost_usd=cost,
                        key_spend=key_spend, elapsed_seconds=elapsed)
+        err.attempts = attempts
+        raise err
     return {
         "content": content,
         "underlying_model": resolved_model or resp.get("model", "unknown"),
@@ -246,6 +254,7 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         "key_spend_total_usd": key_spend,
         "finish_reason": finish_reason,
         "elapsed_seconds": elapsed,
+        "attempts": attempts,
         "reasoning": message.get("reasoning_content"),
         "sampling_params": {k: body_dict[k] for k in ("temperature", "top_p", "seed")
                             if k in body_dict},

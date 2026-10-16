@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import llm_client
 from llm_client import LlmError, append_call
@@ -160,7 +161,8 @@ def main():
     prompt, prev_sig = base, None
     for rnd in range(args.max_repairs + 1):
         tag = f"{cell}.r{rnd}"
-        rec = {"run": os.path.basename(os.path.normpath(args.run_dir)), "cell": cell,
+        rec = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+               "run": os.path.basename(os.path.normpath(args.run_dir)), "cell": cell,
                "kernel": args.kernel, "level": args.level, "model": args.model,
                "repeat": args.repeat, "round": rnd, "feedback": args.feedback if rnd else None,
                "prompt_sha": sha(prompt)}
@@ -168,14 +170,16 @@ def main():
             r = ask(args, prompt)
         except LlmError as e:
             rec.update(stage="no_answer", error=str(e), usage=e.usage, cost_usd=e.cost_usd,
-                       elapsed_seconds=e.elapsed_seconds, stop_reason="api_error")
+                       elapsed_seconds=e.elapsed_seconds, attempts=e.attempts,
+                       stop_reason="api_error")
             append_call(log, rec)
             print(f"{tag}: no_answer ({e})")
             return
 
         rec.update(underlying_model=r["underlying_model"], finish_reason=r["finish_reason"],
                    sampling_params=r["sampling_params"], usage=r["usage"],
-                   cost_usd=r["cost_usd"], elapsed_seconds=r["elapsed_seconds"])
+                   cost_usd=r["cost_usd"], elapsed_seconds=r["elapsed_seconds"],
+                   attempts=r.get("attempts"))
         save(os.path.join(raw_dir, tag + ".txt"), r["content"])
         if r.get("reasoning"):
             save(os.path.join(raw_dir, tag + ".reasoning.txt"), r["reasoning"])

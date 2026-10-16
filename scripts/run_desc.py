@@ -4,6 +4,7 @@
 #            --kernels axpy atax --levels L0 L2 L3 --repeats 2
 
 import argparse
+import itertools
 import json
 import os
 import subprocess
@@ -27,6 +28,13 @@ def finished(log):
         elif r.get("stop_reason"):
             done.add(r["cell"])
     return done
+
+
+def last_record(log):
+    if not os.path.exists(log):
+        return None
+    lines = open(log).read().splitlines()
+    return json.loads(lines[-1]) if lines else None
 
 
 def git(*args):
@@ -54,24 +62,42 @@ def main():
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--max-repairs", type=int, default=0)
     p.add_argument("--feedback", default="none")
+    p.add_argument("--max-errors", type=int, default=5, help="API errors in a row before pausing")
+    p.add_argument("--pause", type=int, default=900, help="seconds to wait after --max-errors")
+    p.add_argument("--max-pauses", type=int, default=3, help="pauses in a row before stopping")
     args = p.parse_args()
     if not API_KEY:
         sys.exit("set RIVAULT_API_KEY first")
 
     run_dir = os.path.join(ROOT, "results", args.run_id)
+    log = os.path.join(run_dir, "calls.jsonl")
     os.makedirs(run_dir, exist_ok=True)
     write_run_txt(run_dir, args)
-    done = finished(os.path.join(run_dir, "calls.jsonl"))
+    done = finished(log)
 
-    for repeat in range(args.repeats):
-        for kernel in args.kernels:
-            for level in args.levels:
-                for model in args.models:
-                    if cell_id(kernel, level, model, repeat) in done:
-                        continue
-                    subprocess.run([sys.executable, GEN, "--kernel", kernel, "--level", level,
-                                    "--model", model, "--run-dir", run_dir, "--repeat", str(repeat),
-                                    "--max-repairs", str(args.max_repairs), "--feedback", args.feedback])
+    errors = pauses = 0
+    cells = itertools.product(range(args.repeats), args.kernels, args.levels, args.models)
+    for repeat, kernel, level, model in cells:
+        cell = cell_id(kernel, level, model, repeat)
+        if cell in done:
+            continue
+        subprocess.run([sys.executable, GEN, "--kernel", kernel, "--level", level,
+                        "--model", model, "--run-dir", run_dir, "--repeat", str(repeat),
+                        "--max-repairs", str(args.max_repairs), "--feedback", args.feedback])
+
+        last = last_record(log)
+        if last and last["cell"] == cell and last["stage"] == "no_answer":
+            errors += 1
+        else:
+            errors = pauses = 0
+        if errors >= args.max_errors:
+            if pauses >= args.max_pauses:
+                sys.exit(f"{errors} API errors in a row after {pauses} pauses, stopping. "
+                         "Run the same command again to resume.")
+            pauses += 1
+            print(f"{errors} API errors in a row, pausing {args.pause}s ({pauses}/{args.max_pauses})")
+            time.sleep(args.pause)
+            errors = 0
 
     print(f"\nfunnel: python3 scripts/desc_funnel.py {run_dir}")
 
