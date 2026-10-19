@@ -27,6 +27,10 @@ SIZE_RE = re.compile(r"^size (\S+): (pass|fail)", re.M)
 ERR_RE = re.compile(r"Error:|error:|undefined reference")
 
 
+def model_label(model, reasoning_effort=None):
+    return f"{model}@reasoning-{reasoning_effort}" if reasoning_effort else model
+
+
 def cell_id(kernel, level, model, repeat):
     return f"{kernel}__{level}__{model.replace('/', '_')}__rep{repeat}"
 
@@ -125,7 +129,8 @@ def ask(args, prompt):
                 "finish_reason": "offline", "sampling_params": {}, "usage": {},
                 "cost_usd": 0.0, "elapsed_seconds": 0.0, "reasoning": None}
     prompt += f"\n/* call-id: {llm_client.new_call_id()} */\n"
-    return llm_client.call_llm(args.model, prompt, temperature=args.temperature, seed=args.seed)
+    return llm_client.call_llm(args.model, prompt, temperature=args.temperature, seed=args.seed,
+                               reasoning_effort=args.reasoning_effort)
 
 
 def save(path, text):
@@ -144,13 +149,15 @@ def main():
     p.add_argument("--feedback", choices=["none", "compile", "compile+tests"], default="none")
     p.add_argument("--temperature", type=float)
     p.add_argument("--seed", type=int)
+    p.add_argument("--reasoning-effort", help="e.g. none: passed to the gateway, cells get a separate label")
     p.add_argument("--reply-file")
     args = p.parse_args()
     if not args.reply_file and not llm_client.API_KEY:
         sys.exit("set RIVAULT_API_KEY first")
 
     kdir, spec, description = load_kernel(args.kernel, args.level)
-    cell = cell_id(args.kernel, args.level, args.model, args.repeat)
+    label = model_label(args.model, args.reasoning_effort)
+    cell = cell_id(args.kernel, args.level, label, args.repeat)
     code_dir = os.path.join(args.run_dir, "code")
     raw_dir = os.path.join(args.run_dir, "raw")
     os.makedirs(code_dir, exist_ok=True)
@@ -163,7 +170,8 @@ def main():
         tag = f"{cell}.r{rnd}"
         rec = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                "run": os.path.basename(os.path.normpath(args.run_dir)), "cell": cell,
-               "kernel": args.kernel, "level": args.level, "model": args.model,
+               "kernel": args.kernel, "level": args.level, "model": label,
+               "api_model": args.model, "reasoning_effort": args.reasoning_effort,
                "repeat": args.repeat, "round": rnd, "feedback": args.feedback if rnd else None,
                "prompt_sha": sha(prompt)}
         try:

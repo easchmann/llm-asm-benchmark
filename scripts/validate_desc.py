@@ -4,7 +4,9 @@
 # usage: python3 scripts/validate_desc.py
 
 import glob
+import json
 import os
+import re
 import sys
 import tempfile
 
@@ -27,9 +29,29 @@ def report(ok, label, detail):
     return ok
 
 
+def normalize(text):
+    return re.sub(r"\s+", " ", text).replace("( ", "(").replace(" )", ")").strip()
+
+
+def signature_matches(kdir):
+    spec = json.load(open(os.path.join(kdir, "spec.json")))
+    driver = normalize(open(os.path.join(kdir, "driver.c")).read())
+    return normalize(spec["signature"]) + ";" in driver
+
+
 def main():
     work = tempfile.mkdtemp(prefix="desc_validate_")
     ok = True
+
+    for spec in sorted(glob.glob(os.path.join(DESC, "*", "spec.json"))):
+        kdir = os.path.dirname(spec)
+        kernel = os.path.basename(kdir)
+        missing = [f for f in ("driver.c", "ref.c", "L0.txt", "L1.txt", "L2.txt", "L3.txt")
+                   if not os.path.exists(os.path.join(kdir, f))]
+        if missing:
+            ok &= report(False, f"{kernel} files", "missing " + ", ".join(missing))
+            continue
+        ok &= report(signature_matches(kdir), f"{kernel} signature", "spec.json matches driver.c")
 
     for hand in sorted(glob.glob(os.path.join(DESC, "*", "hand.S"))):
         kdir = os.path.dirname(hand)

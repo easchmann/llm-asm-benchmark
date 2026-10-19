@@ -120,7 +120,8 @@ def resolve_model(alias, *, timeout=REQUEST_TIMEOUT, base_url=None, api_key=None
 
 
 def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
-             base_url=None, api_key=None, temperature=None, top_p=None, seed=None):
+             base_url=None, api_key=None, temperature=None, top_p=None, seed=None,
+             reasoning_effort=None):
     """One chat/completions round trip, retrying transient gateway failures
     (504/502/503/429/timeouts) with exponential backoff.
 
@@ -148,6 +149,8 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         body_dict["temperature"] = temperature
     if top_p is not None:
         body_dict["top_p"] = top_p
+    if reasoning_effort is not None:
+        body_dict["reasoning_effort"] = reasoning_effort
     body = json.dumps(body_dict).encode()
     req = urllib.request.Request(
         f"{base_url}/chat/completions", data=body,
@@ -256,7 +259,7 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         "elapsed_seconds": elapsed,
         "attempts": attempts,
         "reasoning": message.get("reasoning_content"),
-        "sampling_params": {k: body_dict[k] for k in ("temperature", "top_p", "seed")
+        "sampling_params": {k: body_dict[k] for k in ("temperature", "top_p", "seed", "reasoning_effort")
                             if k in body_dict},
     }
 

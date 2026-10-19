@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from gen_desc import cell_id
+from gen_desc import cell_id, model_label
 from llm_client import API_KEY
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +62,7 @@ def main():
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--max-repairs", type=int, default=0)
     p.add_argument("--feedback", default="none")
+    p.add_argument("--reasoning-effort", help="e.g. none: passed to the gateway, cells get a separate label")
     p.add_argument("--max-errors", type=int, default=5, help="API errors in a row before pausing")
     p.add_argument("--pause", type=int, default=900, help="seconds to wait after --max-errors")
     p.add_argument("--max-pauses", type=int, default=3, help="pauses in a row before stopping")
@@ -78,12 +79,13 @@ def main():
     errors = pauses = 0
     cells = itertools.product(range(args.repeats), args.kernels, args.levels, args.models)
     for repeat, kernel, level, model in cells:
-        cell = cell_id(kernel, level, model, repeat)
+        cell = cell_id(kernel, level, model_label(model, args.reasoning_effort), repeat)
         if cell in done:
             continue
         subprocess.run([sys.executable, GEN, "--kernel", kernel, "--level", level,
                         "--model", model, "--run-dir", run_dir, "--repeat", str(repeat),
-                        "--max-repairs", str(args.max_repairs), "--feedback", args.feedback])
+                        "--max-repairs", str(args.max_repairs), "--feedback", args.feedback]
+                       + (["--reasoning-effort", args.reasoning_effort] if args.reasoning_effort else []))
 
         last = last_record(log)
         if last and last["cell"] == cell and last["stage"] == "no_answer":
