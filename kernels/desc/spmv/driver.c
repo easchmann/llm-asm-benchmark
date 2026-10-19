@@ -35,7 +35,8 @@ int main(void)
         double *val0 = copy(val, nnz), *x0 = copy(x, ncols), *y_ref = copy(y, nrows);
 
         ref_spmv(nrows, ncols, rowptr0, col0, val0, x0, y_ref);
-        spmv(nrows, ncols, rowptr, col, val, x, y);
+        ABI_CALL(spmv, nrows, ncols, rowptr, col, val, x, y);
+        expect_abi();
 
         expect_close("y", y, y_ref, nrows);
         iexpect_unchanged("rowptr", rowptr, rowptr0, nrows + 1);

@@ -27,7 +27,8 @@ int main(void)
         double *tmp_ref = copy(tmp, n), *y_ref = copy(y, n);
 
         ref_gesummv(n, alpha, beta, A0, B0, tmp_ref, x0, y_ref);
-        gesummv(n, alpha, beta, A, B, tmp, x, y);
+        ABI_CALL(gesummv, n, alpha, beta, A, B, tmp, x, y);
+        expect_abi();
 
         expect_close("y", y, y_ref, n);
         expect_unchanged("A", A, A0, n * n);

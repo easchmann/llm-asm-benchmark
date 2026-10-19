@@ -3,12 +3,12 @@
 # usage: python3 scripts/desc_funnel.py results/desc_pilot
 
 import collections
-import json
 import math
-import os
 import sys
 
-STAGES = ["no_answer", "extract_fail", "assemble_fail", "link_fail", "crash", "timeout", "wrong", "pass"]
+from gen_desc import load_records
+
+STAGES = ["no_answer", "extract_fail", "incomplete", "assemble_fail", "link_fail", "crash", "timeout", "wrong", "pass"]
 
 
 def wilson(k, n, z=1.96):
@@ -27,7 +27,7 @@ def rate(k, n):
 
 
 def main():
-    records = [json.loads(line) for line in open(os.path.join(sys.argv[1], "calls.jsonl"))]
+    records = load_records(sys.argv[1])
     final = {r["cell"]: r for r in records if r.get("stop_reason")}
     first_try = {r["cell"] for r in records if r["round"] == 0 and r["stage"] == "pass"}
 

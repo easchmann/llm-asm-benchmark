@@ -21,7 +21,8 @@ int main(void)
         double *A0 = copy(A, m * m), *B_ref = copy(B, m * n);
 
         ref_trmm(m, n, alpha, A0, B_ref);
-        trmm(m, n, alpha, A, B);
+        ABI_CALL(trmm, m, n, alpha, A, B);
+        expect_abi();
 
         expect_close("B", B, B_ref, m * n);
         expect_unchanged("A", A, A0, m * m);

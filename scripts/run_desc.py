@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # run a matrix of description->asm cells, skipping cells that already finished
 # usage: python3 scripts/run_desc.py --run-id desc_pilot --models Qwen/Qwen3.8-27B zai-org/GLM-5.3-Flash \
-#            --kernels axpy atax --levels L0 L2 L3 --repeats 2
+#            --kernels axpy atax --levels L0 L2 L3 --repeats 2 [--shard name]
+# with --shard, this process logs to <run>/calls/<name>.jsonl, so several processes can share one run
 
 import argparse
 import itertools
@@ -11,19 +12,17 @@ import subprocess
 import sys
 import time
 
-from gen_desc import cell_id, model_label
+from gen_desc import cell_id, load_records, model_label
 from llm_client import API_KEY
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GEN = os.path.join(ROOT, "scripts", "gen_desc.py")
 
 
-def finished(log):
-    if not os.path.exists(log):
-        return set()
+def finished(run_dir):
     done = set()
-    for r in map(json.loads, open(log)):
-        if r.get("stop_reason") == "api_error":
+    for r in load_records(run_dir):
+        if r.get("stop_reason") == "api_error" and r.get("round", 0) == 0:
             done.discard(r["cell"])
         elif r.get("stop_reason"):
             done.add(r["cell"])
@@ -66,15 +65,16 @@ def main():
     p.add_argument("--max-errors", type=int, default=5, help="API errors in a row before pausing")
     p.add_argument("--pause", type=int, default=900, help="seconds to wait after --max-errors")
     p.add_argument("--max-pauses", type=int, default=3, help="pauses in a row before stopping")
+    p.add_argument("--shard", help="name of this process; logs to <run>/calls/<shard>.jsonl")
     args = p.parse_args()
     if not API_KEY:
         sys.exit("set RIVAULT_API_KEY first")
 
     run_dir = os.path.join(ROOT, "results", args.run_id)
-    log = os.path.join(run_dir, "calls.jsonl")
-    os.makedirs(run_dir, exist_ok=True)
+    log = os.path.join(run_dir, "calls", f"{args.shard}.jsonl") if args.shard else os.path.join(run_dir, "calls.jsonl")
+    os.makedirs(os.path.dirname(log), exist_ok=True)
     write_run_txt(run_dir, args)
-    done = finished(log)
+    done = finished(run_dir)
 
     errors = pauses = 0
     cells = itertools.product(range(args.repeats), args.kernels, args.levels, args.models)
@@ -84,7 +84,7 @@ def main():
             continue
         subprocess.run([sys.executable, GEN, "--kernel", kernel, "--level", level,
                         "--model", model, "--run-dir", run_dir, "--repeat", str(repeat),
-                        "--max-repairs", str(args.max_repairs), "--feedback", args.feedback]
+                        "--max-repairs", str(args.max_repairs), "--feedback", args.feedback, "--log", log]
                        + (["--reasoning-effort", args.reasoning_effort] if args.reasoning_effort else []))
 
         last = last_record(log)

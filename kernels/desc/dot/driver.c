@@ -20,7 +20,8 @@ int main(void)
         double *x0 = copy(x, n), *y0 = copy(y, n);
 
         double want = ref_dot(n, x0, y0);
-        double got = dot(n, x, y);
+        double got = ABI_CALL(dot, n, x, y);
+        expect_abi();
 
         expect_close("return value", &got, &want, 1);
         expect_unchanged("x", x, x0, n);

@@ -20,7 +20,8 @@ int main(void)
         long *a0 = icopy(a, n), *out_ref = icopy(out, n);
 
         ref_prefix_sum(n, a0, out_ref);
-        prefix_sum(n, a, out);
+        ABI_CALL(prefix_sum, n, a, out);
+        expect_abi();
 
         expect_equal("out", out, out_ref, n);
         iexpect_unchanged("a", a, a0, n);

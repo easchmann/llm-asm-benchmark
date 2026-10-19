@@ -20,7 +20,8 @@ int main(void)
         long *data0 = icopy(data, n), *hist_ref = icopy(hist, nbins);
 
         ref_histogram(n, data0, nbins, hist_ref);
-        histogram(n, data, nbins, hist);
+        ABI_CALL(histogram, n, data, nbins, hist);
+        expect_abi();
 
         expect_equal("hist", hist, hist_ref, nbins);
         iexpect_unchanged("data", data, data0, n);

@@ -28,7 +28,8 @@ int main(void)
         long *sorted0 = icopy(sorted, n), *keys0 = icopy(keys, q), *idx_ref = icopy(idx, q);
 
         ref_lower_bound(n, sorted0, q, keys0, idx_ref);
-        lower_bound(n, sorted, q, keys, idx);
+        ABI_CALL(lower_bound, n, sorted, q, keys, idx);
+        expect_abi();
 
         expect_equal("idx", idx, idx_ref, q);
         iexpect_unchanged("sorted", sorted, sorted0, n);

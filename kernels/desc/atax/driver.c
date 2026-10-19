@@ -23,7 +23,8 @@ int main(void)
         double *y_ref = copy(y, n), *tmp_ref = copy(tmp, m);
 
         ref_atax(m, n, A0, x0, y_ref, tmp_ref);
-        atax(m, n, A, x, y, tmp);
+        ABI_CALL(atax, m, n, A, x, y, tmp);
+        expect_abi();
 
         expect_close("y", y, y_ref, n);
         expect_unchanged("A", A, A0, m * n);

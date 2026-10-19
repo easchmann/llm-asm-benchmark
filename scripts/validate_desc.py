@@ -56,13 +56,18 @@ def main():
     for hand in sorted(glob.glob(os.path.join(DESC, "*", "hand.S"))):
         kdir = os.path.dirname(hand)
         kernel = os.path.basename(kdir)
-        stage, sizes, _ = check(hand, kdir, os.path.join(work, kernel))
+        stage, sizes, _, _ = check(hand, kdir, os.path.join(work, kernel))
         ok &= report(stage == "pass", f"{kernel} hand.S", f"{stage} {sizes}")
         for mutant in sorted(glob.glob(os.path.join(kdir, "mutants", "*.S"))):
             name = os.path.basename(mutant)[:-2]
-            stage, sizes, details = check(mutant, kdir, os.path.join(work, f"{kernel}_{name}"))
+            stage, sizes, details, _ = check(mutant, kdir, os.path.join(work, f"{kernel}_{name}"))
             first = next((l for l in details.splitlines() if ": fail" in l), "")
             ok &= report(stage != "pass", f"{kernel} mutant {name}", f"{stage} {first}")
+
+    unfinished = os.path.join(work, "unfinished.S")
+    open(unfinished, "w").write(".globl axpy\naxpy:\n    movq %rdi, %rax\n")
+    stage = check(unfinished, os.path.join(DESC, "axpy"), os.path.join(work, "unfinished"))[0]
+    ok &= report(stage == "incomplete", "answer without ret", stage)
 
     for label, reply, want in REPLIES:
         _, how = extract_asm(reply, "axpy")

@@ -29,7 +29,8 @@ int main(void)
         double *E_ref = copy(E, ni * nj), *F_ref = copy(F, nj * nl), *G_ref = copy(G, ni * nl);
 
         ref_3mm(ni, nj, nk, nl, nm, E_ref, A0, B0, F_ref, C0, D0, G_ref);
-        mm3(ni, nj, nk, nl, nm, E, A, B, F, C, D, G);
+        ABI_CALL(mm3, ni, nj, nk, nl, nm, E, A, B, F, C, D, G);
+        expect_abi();
 
         expect_close("G", G, G_ref, ni * nl);
         expect_unchanged("A", A, A0, ni * nk);

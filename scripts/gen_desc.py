@@ -7,7 +7,9 @@ import argparse
 import hashlib
 import json
 import os
+import glob
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -25,6 +27,8 @@ THINK_RE = re.compile(r"<\s*(?:\w+:)?think(?:ing)?\s*>.*?<\s*/\s*(?:\w+:)?think(
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
 SIZE_RE = re.compile(r"^size (\S+): (pass|fail)", re.M)
 ERR_RE = re.compile(r"Error:|error:|undefined reference")
+RET_RE = re.compile(r"^\s*(?:[\w.]+:\s*)?(?:rep\s+|repz\s+)?ret[qlw]?\b", re.M)
+TIMEOUT_SIGNALS = {signal.SIGXCPU, signal.SIGKILL}
 
 
 def model_label(model, reasoning_effort=None):
@@ -33,6 +37,18 @@ def model_label(model, reasoning_effort=None):
 
 def cell_id(kernel, level, model, repeat):
     return f"{kernel}__{level}__{model.replace('/', '_')}__rep{repeat}"
+
+
+def log_files(run_dir):
+    files = glob.glob(os.path.join(run_dir, "calls.jsonl")) + glob.glob(os.path.join(run_dir, "calls", "*.jsonl"))
+    return sorted(files)
+
+
+def load_records(run_dir):
+    records = []
+    for path in log_files(run_dir):
+        records += [json.loads(line) for line in open(path) if line.strip()]
+    return records
 
 
 def sha(text):
@@ -72,7 +88,7 @@ def extract_asm(reply, name):
 def error_lines(stderr, limit=20):
     seen = []
     for line in stderr.splitlines():
-        line = re.sub(r"^\S+\.S:(\d+):", r"line \1:", line)
+        line = re.sub(r"^[^\s:]+:(\d+):", r"line \1:", line)
         line = re.sub(r"^\S+\.o:\s*", "", line)
         if ERR_RE.search(line) and line not in seen:
             seen.append(line)
@@ -97,24 +113,34 @@ def run(exe):
     rc, timed_out = run_binary(exe, out, exe + ".err")
     text = open(out, errors="replace").read() if os.path.exists(out) else ""
     sizes = dict(SIZE_RE.findall(text))
-    if timed_out:
-        return "timeout", sizes, text
+    passed = ", ".join(s for s, v in sizes.items() if v == "pass") or "none"
+    info = {"exit_code": rc, "signal": None}
     if rc < 0:
-        return "crash", sizes, text
-    return ("pass" if rc == 0 and sizes else "wrong"), sizes, text
+        info["signal"] = signal.Signals(-rc).name
+    if timed_out or (rc < 0 and -rc in TIMEOUT_SIGNALS):
+        return "timeout", sizes, text + f"\nThe program did not finish in time (sizes passed before: {passed}).", info
+    if rc < 0:
+        return "crash", sizes, text + f"\nThe program crashed with {info['signal']} (sizes passed before the crash: {passed}).", info
+    return ("pass" if rc == 0 and sizes else "wrong"), sizes, text, info
 
 
 def check(asm_path, kdir, exe):
+    if not RET_RE.search(open(asm_path).read()):
+        return "incomplete", {}, "The function contains no ret instruction; the answer looks unfinished.", {}
     stage, log = build(asm_path, kdir, exe)
     if stage:
-        return stage, {}, log
+        return stage, {}, log, {}
     return run(exe)
+
+
+def fail_lines(details, limit=5):
+    return [l for l in details.splitlines() if ": fail " in l][:limit]
 
 
 def feedback(stage, details, mode):
     if mode == "none":
         return None
-    if stage == "extract_fail":
+    if stage in ("extract_fail", "incomplete"):
         return details
     if stage in ("assemble_fail", "link_fail"):
         return "Your code did not build:\n" + "\n".join(error_lines(details))
@@ -151,6 +177,7 @@ def main():
     p.add_argument("--seed", type=int)
     p.add_argument("--reasoning-effort", help="e.g. none: passed to the gateway, cells get a separate label")
     p.add_argument("--reply-file")
+    p.add_argument("--log", help="log file (default: <run-dir>/calls.jsonl)")
     args = p.parse_args()
     if not args.reply_file and not llm_client.API_KEY:
         sys.exit("set RIVAULT_API_KEY first")
@@ -162,7 +189,7 @@ def main():
     raw_dir = os.path.join(args.run_dir, "raw")
     os.makedirs(code_dir, exist_ok=True)
     os.makedirs(raw_dir, exist_ok=True)
-    log = os.path.join(args.run_dir, "calls.jsonl")
+    log = args.log or os.path.join(args.run_dir, "calls.jsonl")
 
     base = build_prompt(spec, description)
     prompt, prev_sig = base, None
@@ -195,16 +222,21 @@ def main():
         asm, how = extract_asm(r["content"], spec["name"])
         rec["extract_reason"] = how
         if asm is None:
-            stage, sizes, details = "extract_fail", {}, f"Your answer contained no .globl {spec['name']}."
+            stage, sizes, details, info = "extract_fail", {}, f"Your answer contained no .globl {spec['name']}.", {}
         else:
             asm_path = os.path.join(code_dir, tag + ".S")
             save(asm_path, asm.rstrip() + "\n")
             rec["asm_sha"] = sha(asm)
-            stage, sizes, details = check(asm_path, kdir, os.path.join(code_dir, tag))
+            stage, sizes, details, info = check(asm_path, kdir, os.path.join(code_dir, tag))
 
         errors = error_lines(details) if stage in ("assemble_fail", "link_fail") else []
-        sig = sha(stage + "\n".join(sorted(errors)) + json.dumps(sizes, sort_keys=True))
-        rec.update(stage=stage, sizes=sizes, first_error=errors[0] if errors else None, error_sig=sig)
+        failures = fail_lines(details) if stage in ("wrong", "crash", "timeout") else []
+        shape = [re.sub(r"[-\d.e+]+", "#", l) for l in failures]
+        sig = sha(stage + "\n".join(sorted(errors)) + "\n".join(shape) + json.dumps(sizes, sort_keys=True))
+        rec.update(stage=stage, sizes=sizes, sizes_passed=sum(v == "pass" for v in sizes.values()),
+                   first_error=errors[0] if errors else None, error_lines=errors[:5],
+                   test_failures=failures, signal=info.get("signal"), exit_code=info.get("exit_code"),
+                   error_sig=sig)
 
         note = feedback(stage, details, args.feedback)
         if stage == "pass":

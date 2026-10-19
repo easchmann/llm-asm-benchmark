@@ -25,7 +25,8 @@ int main(void)
         long *a0 = icopy(a, n), *counts_ref = icopy(counts, n);
 
         ref_popcount(n, (const unsigned long *)a0, counts_ref);
-        popcount(n, (const unsigned long *)a, counts);
+        ABI_CALL(popcount, n, (const unsigned long *)a, counts);
+        expect_abi();
 
         expect_equal("counts", counts, counts_ref, n);
         iexpect_unchanged("a", a, a0, n);

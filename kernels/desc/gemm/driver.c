@@ -22,7 +22,8 @@ int main(void)
         double *A0 = copy(A, ni * nk), *B0 = copy(B, nk * nj), *C_ref = copy(C, ni * nj);
 
         ref_gemm(ni, nj, nk, alpha, beta, C_ref, A0, B0);
-        gemm(ni, nj, nk, alpha, beta, C, A, B);
+        ABI_CALL(gemm, ni, nj, nk, alpha, beta, C, A, B);
+        expect_abi();
 
         expect_close("C", C, C_ref, ni * nj);
         expect_unchanged("A", A, A0, ni * nk);

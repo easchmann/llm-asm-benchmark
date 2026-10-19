@@ -20,7 +20,8 @@ int main(void)
         double *x_ref = copy(x, n);
 
         ref_scal(n, a, x_ref);
-        scal(n, a, x);
+        ABI_CALL(scal, n, a, x);
+        expect_abi();
 
         expect_close("x", x, x_ref, n);
         expect_guards("x", x, n);

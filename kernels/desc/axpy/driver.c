@@ -21,7 +21,8 @@ int main(void)
         double *x0 = copy(x, n), *y_ref = copy(y, n);
 
         ref_axpy(n, a, x0, y_ref);
-        axpy(n, a, x, y);
+        ABI_CALL(axpy, n, a, x, y);
+        expect_abi();
 
         expect_close("y", y, y_ref, n);
         expect_unchanged("x", x, x0, n);

@@ -21,7 +21,8 @@ int main(void)
         double *A0 = copy(A, n * m), *C_ref = copy(C, n * n);
 
         ref_syrk(n, m, alpha, beta, C_ref, A0);
-        syrk(n, m, alpha, beta, C, A);
+        ABI_CALL(syrk, n, m, alpha, beta, C, A);
+        expect_abi();
 
         expect_close("C", C, C_ref, n * n);
         expect_unchanged("A", A, A0, n * m);

@@ -24,7 +24,8 @@ int main(void)
         double *s_ref = copy(s, m), *q_ref = copy(q, n);
 
         ref_bicg(m, n, A0, s_ref, q_ref, p0, r0);
-        bicg(m, n, A, s, q, p, r);
+        ABI_CALL(bicg, m, n, A, s, q, p, r);
+        expect_abi();
 
         expect_close("s", s, s_ref, m);
         expect_close("q", q, q_ref, n);

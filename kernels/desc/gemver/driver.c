@@ -33,7 +33,8 @@ int main(void)
         double *A_ref = copy(A, n * n), *w_ref = copy(w, n), *x_ref = copy(x, n);
 
         ref_gemver(n, alpha, beta, A_ref, u10, v10, u20, v20, w_ref, x_ref, y0, z0);
-        gemver(n, alpha, beta, A, u1, v1, u2, v2, w, x, y, z);
+        ABI_CALL(gemver, n, alpha, beta, A, u1, v1, u2, v2, w, x, y, z);
+        expect_abi();
 
         expect_close("A", A, A_ref, n * n);
         expect_close("x", x, x_ref, n);

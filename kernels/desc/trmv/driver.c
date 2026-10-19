@@ -21,7 +21,8 @@ int main(void)
         double *L0 = copy(L, n * n), *x0 = copy(x, n), *y_ref = copy(y, n);
 
         ref_trmv(n, L0, x0, y_ref);
-        trmv(n, L, x, y);
+        ABI_CALL(trmv, n, L, x, y);
+        expect_abi();
 
         expect_close("y", y, y_ref, n);
         expect_unchanged("L", L, L0, n * n);

@@ -22,7 +22,8 @@ int main(void)
         long *a_ref = icopy(a, n);
 
         ref_sort8(n, a_ref);
-        sort8(n, a);
+        ABI_CALL(sort8, n, a);
+        expect_abi();
 
         expect_equal("a", a, a_ref, n);
         iexpect_guards("a", a, n);

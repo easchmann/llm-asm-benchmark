@@ -12,6 +12,54 @@
 #define GUARD 64
 #define GUARD_BYTE 0xA5
 
+void *abi_target;
+unsigned long abi_ret, abi_saved[7], abi_after[7];
+
+static const unsigned long ABI_SENTINEL[6] = {
+    0x5b5b5b5b5b5b5b01UL, 0x5b5b5b5b5b5b5b02UL, 0x5b5b5b5b5b5b5b03UL,
+    0x5b5b5b5b5b5b5b04UL, 0x5b5b5b5b5b5b5b05UL, 0x5b5b5b5b5b5b5b06UL,
+};
+static const char *ABI_NAMES[6] = {"rbx", "rbp", "r12", "r13", "r14", "r15"};
+
+void abi_tramp(void);
+__asm__(
+    ".text\n"
+    ".globl abi_tramp\n"
+    "abi_tramp:\n"
+    "    popq abi_ret(%rip)\n"
+    "    movq %rbx, abi_saved+0(%rip)\n"
+    "    movq %rbp, abi_saved+8(%rip)\n"
+    "    movq %r12, abi_saved+16(%rip)\n"
+    "    movq %r13, abi_saved+24(%rip)\n"
+    "    movq %r14, abi_saved+32(%rip)\n"
+    "    movq %r15, abi_saved+40(%rip)\n"
+    "    movq %rsp, abi_saved+48(%rip)\n"
+    "    movabsq $0x5b5b5b5b5b5b5b01, %rbx\n"
+    "    movabsq $0x5b5b5b5b5b5b5b02, %rbp\n"
+    "    movabsq $0x5b5b5b5b5b5b5b03, %r12\n"
+    "    movabsq $0x5b5b5b5b5b5b5b04, %r13\n"
+    "    movabsq $0x5b5b5b5b5b5b5b05, %r14\n"
+    "    movabsq $0x5b5b5b5b5b5b5b06, %r15\n"
+    "    call *abi_target(%rip)\n"
+    "    movq %rbx, abi_after+0(%rip)\n"
+    "    movq %rbp, abi_after+8(%rip)\n"
+    "    movq %r12, abi_after+16(%rip)\n"
+    "    movq %r13, abi_after+24(%rip)\n"
+    "    movq %r14, abi_after+32(%rip)\n"
+    "    movq %r15, abi_after+40(%rip)\n"
+    "    movq %rsp, abi_after+48(%rip)\n"
+    "    movq abi_saved+48(%rip), %rsp\n"
+    "    movq abi_saved+0(%rip), %rbx\n"
+    "    movq abi_saved+8(%rip), %rbp\n"
+    "    movq abi_saved+16(%rip), %r12\n"
+    "    movq abi_saved+24(%rip), %r13\n"
+    "    movq abi_saved+32(%rip), %r14\n"
+    "    movq abi_saved+40(%rip), %r15\n"
+    "    pushq abi_ret(%rip)\n"
+    "    ret\n");
+
+#define ABI_CALL(f, ...) (abi_target = (void *)(f), ((__typeof__(&f))(void *)abi_tramp)(__VA_ARGS__))
+
 static const char *current_size;
 static int size_failures;
 static int failed_sizes;
@@ -101,6 +149,15 @@ static void expect_guards(const char *name, const double *v, long n)
             return;
         }
     }
+}
+
+static void expect_abi(void)
+{
+    for (int i = 0; i < 6; i++)
+        if (abi_after[i] != ABI_SENTINEL[i])
+            fail("callee-saved register %s not preserved", ABI_NAMES[i]);
+    if (abi_after[6] != abi_saved[6])
+        fail("stack pointer not restored (off by %ld bytes)", (long)(abi_after[6] - abi_saved[6]));
 }
 
 #endif

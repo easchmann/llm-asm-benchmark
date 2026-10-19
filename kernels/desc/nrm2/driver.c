@@ -19,7 +19,8 @@ int main(void)
         double *x0 = copy(x, n);
 
         double want = ref_nrm2(n, x0);
-        double got = nrm2(n, x);
+        double got = ABI_CALL(nrm2, n, x);
+        expect_abi();
 
         expect_close("return value", &got, &want, 1);
         expect_unchanged("x", x, x0, n);

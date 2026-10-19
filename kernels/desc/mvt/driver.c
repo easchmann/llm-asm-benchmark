@@ -24,7 +24,8 @@ int main(void)
         double *x1_ref = copy(x1, n), *x2_ref = copy(x2, n);
 
         ref_mvt(n, x1_ref, x2_ref, y_10, y_20, A0);
-        mvt(n, x1, x2, y_1, y_2, A);
+        ABI_CALL(mvt, n, x1, x2, y_1, y_2, A);
+        expect_abi();
 
         expect_close("x1", x1, x1_ref, n);
         expect_close("x2", x2, x2_ref, n);

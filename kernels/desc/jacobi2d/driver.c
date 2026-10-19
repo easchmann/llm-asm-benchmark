@@ -21,7 +21,8 @@ int main(void)
         double *A_ref = copy(A, cells), *B_ref = copy(B, cells);
 
         ref_jacobi2d(tsteps, n, A_ref, B_ref);
-        jacobi2d(tsteps, n, A, B);
+        ABI_CALL(jacobi2d, tsteps, n, A, B);
+        expect_abi();
 
         expect_close("A", A, A_ref, cells);
         expect_close("B", B, B_ref, cells);

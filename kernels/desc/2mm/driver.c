@@ -27,7 +27,8 @@ int main(void)
         double *tmp_ref = copy(tmp, ni * nj), *D_ref = copy(D, ni * nl);
 
         ref_2mm(ni, nj, nk, nl, alpha, beta, tmp_ref, A0, B0, C0, D_ref);
-        mm2(ni, nj, nk, nl, alpha, beta, tmp, A, B, C, D);
+        ABI_CALL(mm2, ni, nj, nk, nl, alpha, beta, tmp, A, B, C, D);
+        expect_abi();
 
         expect_close("D", D, D_ref, ni * nl);
         expect_unchanged("A", A, A0, ni * nk);
