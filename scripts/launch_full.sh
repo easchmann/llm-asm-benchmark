@@ -42,10 +42,15 @@ for shard in ${@:-$ALL}; do
         continue
     fi
     if tmux has-session -t "$session" 2>/dev/null; then
-        echo "$session already running, left alone"
-        continue
+        busy=$(tmux list-panes -t "$session" -F "#{pane_current_command}" | grep -v -x -E "bash|sh|zsh" || true)
+        if [ -n "$busy" ]; then
+            echo "$session is still running ($busy), left alone"
+            continue
+        fi
+        echo "$session exists but is idle, reusing it"
+    else
+        tmux new-session -d -s "$session" -c "$ROOT"
     fi
-    tmux new-session -d -s "$session" -c "$ROOT"
     tmux send-keys -t "$session" 'export RIVAULT_API_KEY=$(tr -d "\n" < ~/.rivault_key)' Enter
     tmux send-keys -t "$session" "$cmd" Enter
     echo "started $session"

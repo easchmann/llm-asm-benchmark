@@ -44,7 +44,7 @@ def write_run_txt(run_dir, args):
     lines = [
         f"started: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
         f"commit: {git('rev-parse', 'HEAD')}",
-        f"dirty: {bool(git('status', '--porcelain'))}",
+        f"dirty: {bool(git('status', '--porcelain', '--untracked-files=no'))}",
         f"host_avx2: {'avx2' in open('/proc/cpuinfo').read()}",
         f"args: {json.dumps(vars(args))}",
     ]
