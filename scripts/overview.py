@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+# overview tables of a description->asm run, as markdown
+# usage: python3 scripts/overview.py results/desc_full
+
+import collections
+import sys
+
+from desc_repair import CATEGORY, ORDER, trajectories
+from gen_desc import load_records
+
+
+def pct(k, n):
+    return f"{100 * k / n:.0f}%" if n else "-"
+
+
+def print_table(header, rows):
+    print("| " + " | ".join(header) + " |")
+    print("|" + "---|" * len(header))
+    for row in rows:
+        print("| " + " | ".join(str(c) for c in row) + " |")
+    print()
+
+
+def summary(cells):
+    answered = [rs for rs in cells if rs[0]["stage"] != "no_answer"]
+    first = sum(rs[0]["stage"] == "pass" for rs in answered)
+    final = sum(rs[-1]["stage"] == "pass" for rs in answered)
+    cost = sum(r.get("cost_usd") or 0 for rs in cells for r in rs)
+    return [len(cells), len(cells) - len(answered), pct(first, len(answered)), pct(final, len(answered)), f"${cost:.2f}"]
+
+
+cells = list(trajectories(load_records(sys.argv[1])).values())
+groups = collections.defaultdict(list)
+for rs in cells:
+    r = rs[0]
+    groups["all", r["model"]].append(rs)
+    groups["level", r["model"], r["level"]].append(rs)
+    groups["category", r["model"], CATEGORY.get(r["kernel"], "other")].append(rs)
+
+print_table(["model", "cells", "no answer", "pass first try", "pass after repair", "cost"],
+            [[k[1]] + summary(v) for k, v in sorted(groups.items()) if k[0] == "all"])
+
+for name in ("level", "category"):
+    print_table(["model", name, "cells", "no answer", "pass first try", "pass after repair", "cost"],
+                [[k[1], k[2]] + summary(v) for k, v in sorted(groups.items()) if k[0] == name])
+
+stages = [s for s in ORDER if s != "pass"]
+rows = []
+for k, v in sorted(groups.items()):
+    if k[0] == "all":
+        final = collections.Counter(rs[-1]["stage"] for rs in v)
+        rows.append([k[1]] + [final[s] for s in stages])
+print("final stage of cells that did not pass")
+print()
+print_table(["model"] + stages, rows)

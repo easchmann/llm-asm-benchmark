@@ -66,6 +66,9 @@ def main():
     p.add_argument("--pause", type=int, default=900, help="seconds to wait after --max-errors")
     p.add_argument("--max-pauses", type=int, default=3, help="pauses in a row before stopping")
     p.add_argument("--shard", help="name of this process; logs to <run>/calls/<shard>.jsonl")
+    p.add_argument("--temperature", type=float)
+    p.add_argument("--seed", type=int, help="same seed for every call")
+    p.add_argument("--seed-per-repeat", action="store_true", help="use seed + repeat instead of the same seed")
     args = p.parse_args()
     if not API_KEY:
         sys.exit("set RIVAULT_API_KEY first")
@@ -85,7 +88,9 @@ def main():
         subprocess.run([sys.executable, GEN, "--kernel", kernel, "--level", level,
                         "--model", model, "--run-dir", run_dir, "--repeat", str(repeat),
                         "--max-repairs", str(args.max_repairs), "--feedback", args.feedback, "--log", log]
-                       + (["--reasoning-effort", args.reasoning_effort] if args.reasoning_effort else []))
+                       + (["--reasoning-effort", args.reasoning_effort] if args.reasoning_effort else [])
+                       + (["--temperature", str(args.temperature)] if args.temperature is not None else [])
+                       + (["--seed", str(args.seed + (repeat if args.seed_per_repeat else 0))] if args.seed is not None else []))
 
         last = last_record(log)
         if last and last["cell"] == cell and last["stage"] == "no_answer":
