@@ -3,7 +3,7 @@
 # usage: python3 scripts/gen_desc.py --kernel atax --level L2 --model Qwen/Qwen3.8-27B --run-dir results/desc_test
 #        --reply-file reply.txt uses a saved reply instead of calling the API
 #        --start-from results/desc_full takes round 0 from that run's saved reply for the same cell
-#        --target c asks for C instead of assembly (baseline: same task, compiled with gcc -O2)
+#        --target c asks for C instead of assembly (baseline: same task, compiled with gcc C_FLAGS)
 
 import argparse
 import hashlib
@@ -26,6 +26,7 @@ PROMPT = os.path.join(ROOT, "prompts", "desc_x86_64.txt")
 REPAIR = os.path.join(ROOT, "prompts", "desc_repair.txt")
 C_PROMPT = os.path.join(ROOT, "prompts", "desc_c.txt")
 C_REPAIR = os.path.join(ROOT, "prompts", "desc_c_repair.txt")
+C_FLAGS = ["-O2", "-march=x86-64-v3"]
 
 THINK_RE = re.compile(r"<\s*(?:\w+:)?think(?:ing)?\s*>.*?<\s*/\s*(?:\w+:)?think(?:ing)?\s*>", re.S | re.I)
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
@@ -127,7 +128,7 @@ def build(asm_path, kdir, exe, diag=False, debug=False):
     obj = exe + ".o"
     g = ["-g"] if debug else []
     c = asm_path.endswith(".c")
-    r = subprocess.run(["gcc", *g, *(["-O2"] if c else []), "-c", asm_path, "-o", obj], capture_output=True, text=True)
+    r = subprocess.run(["gcc", *g, *(C_FLAGS if c else []), "-c", asm_path, "-o", obj], capture_output=True, text=True)
     if r.returncode:
         return "compile_fail" if c else "assemble_fail", r.stderr
     flags = g + (["-DDESC_DIAG", "-D_GNU_SOURCE"] if diag else [])
@@ -298,7 +299,7 @@ def main():
     p.add_argument("--temperature", type=float)
     p.add_argument("--seed", type=int)
     p.add_argument("--reasoning-effort", help="e.g. none: passed to the gateway, cells get a separate label")
-    p.add_argument("--target", choices=["asm", "c"], default="asm", help="c: the model writes C, compiled with gcc -O2")
+    p.add_argument("--target", choices=["asm", "c"], default="asm", help="c: the model writes C, compiled with gcc C_FLAGS")
     p.add_argument("--base-model", help="the model behind an alias such as RiVault/Reasoning-Medium, logged as base_model")
     p.add_argument("--no-nonce", action="store_true", help="no call-id in the prompt and no gateway cache")
     p.add_argument("--reply-file")

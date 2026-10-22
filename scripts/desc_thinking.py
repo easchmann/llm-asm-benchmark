@@ -5,6 +5,7 @@
 # a variant is a model label in a run; without --pair the variants of each base model are paired automatically:
 # the one whose calls report no reasoning tokens is "off", every other one is compared against it
 # --pair takes labels such as zai-org/GLM-5.3-Flash@reasoning-none, or run:label where a label is in several runs
+# a label that is in several runs (a control slice rerun later) is also compared with itself: drift between the runs
 
 import argparse
 import collections
@@ -74,6 +75,11 @@ def auto_pairs(variants):
     return pairs
 
 
+def match(a, b):
+    return [(a[k], b[k]) for k in sorted(a.keys() & b.keys())
+            if a[k][0]["stage"] != "no_answer" and b[k][0]["stage"] != "no_answer"]
+
+
 def passed(rounds, final):
     return (rounds[-1] if final else rounds[0])["stage"] == "pass"
 
@@ -104,19 +110,29 @@ def main():
     args = p.parse_args()
 
     variants = load(args.run_dirs)
+    runs = [os.path.basename(os.path.normpath(d)) for d in args.run_dirs]
     heading("Variants")
-    table(["run", "model", "base model", "cells", "no answer", "reasoning tokens per call", "reasoning"],
-          [[run, model, base_model(cells), len(cells), sum(rs[0]["stage"] == "no_answer" for rs in cells.values()),
+    table(["run", "model", "base model", "underlying model", "cells", "no answer", "reasoning tokens per call", "reasoning"],
+          [[run, model, base_model(cells), ", ".join(sorted({str(r.get("underlying_model")) for r in calls(cells)})),
+            len(cells), sum(rs[0]["stage"] == "no_answer" for rs in cells.values()),
             f"{sum(map(reasoning_tokens, calls(cells))) / max(len(calls(cells)), 1):.0f}",
             "on" if thinks(cells) else "off"] for (run, model), cells in sorted(variants.items())])
 
+    drift = [(a, b) for a in variants for b in variants if a[1] == b[1] and runs.index(a[0]) < runs.index(b[0])]
+    if drift:
+        heading("Same variant in two runs, later - earlier (drift check, 95% CI, bootstrap over kernels)")
+        rows = []
+        for a, b in drift:
+            g = match(variants[a], variants[b])
+            if g:
+                rows.append([a[1], a[0], b[0], len(g)] +
+                            [x for final in (False, True)
+                             for x in (f"{100 * rate(g, 0, final):.0f}%", f"{100 * rate(g, 1, final):.0f}%", diff(g, final))])
+        table(["model", "earlier", "later", "cells", "first try earlier", "first try later", "later - earlier",
+               "after repair earlier", "after repair later", "later - earlier"], rows)
+
     chosen = [(find(off, variants), find(on, variants)) for off, on in args.pair] if args.pair else auto_pairs(variants)
-    matched = {}
-    for off, on in chosen:
-        a, b = variants[off], variants[on]
-        keys = sorted(k for k in a.keys() & b.keys()
-                      if a[k][0]["stage"] != "no_answer" and b[k][0]["stage"] != "no_answer")
-        matched[off, on] = [(a[k], b[k]) for k in keys]
+    matched = {(off, on): match(variants[off], variants[on]) for off, on in chosen}
     if not matched:
         sys.exit("no pairs of variants found; give them with --pair OFF ON")
 

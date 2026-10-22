@@ -14,7 +14,7 @@ import sys
 import time
 
 from desc_repair import trajectories
-from gen_desc import cell_id, load_records, model_label
+from gen_desc import C_FLAGS, cell_id, load_records, model_label
 from llm_client import API_KEY
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -51,7 +51,7 @@ def write_run_txt(run_dir, args):
         f"nonce: {not args.no_nonce}",
         f"feedback: {args.feedback}",
         f"start_from: {args.start_from}",
-        f"target: {args.target}",
+        f"target: {args.target}" + (f" (gcc {' '.join(C_FLAGS)})" if args.target == "c" else ""),
         f"base_model: {args.base_model or ', '.join(args.models)}",
         f"args: {json.dumps(vars(args))}",
     ]
@@ -69,7 +69,7 @@ def main():
     p.add_argument("--max-repairs", type=int, default=0)
     p.add_argument("--feedback", default="none")
     p.add_argument("--reasoning-effort", help="e.g. none: passed to the gateway, cells get a separate label")
-    p.add_argument("--target", choices=["asm", "c"], default="asm", help="c: the model writes C, compiled with gcc -O2")
+    p.add_argument("--target", choices=["asm", "c"], default="asm", help="c: the model writes C, compiled with gcc C_FLAGS")
     p.add_argument("--base-model", help="the model behind an alias such as RiVault/Reasoning-Medium, logged as base_model")
     p.add_argument("--max-errors", type=int, default=5, help="API errors in a row before pausing")
     p.add_argument("--pause", type=int, default=900, help="seconds to wait after --max-errors")

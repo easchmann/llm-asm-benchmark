@@ -22,6 +22,7 @@ CATEGORIES = [("blas1", "BLAS-1"), ("blas2", "BLAS-2"), ("blas3", "BLAS-3"),
               ("stencil", "stencil"), ("integer", "integer"), ("irregular", "irregular")]
 ROUND_BINS = [("round 0 (first try)", "rnd0"), ("round 1", "rnd1"), ("round 2", "rnd2"),
               ("round 3", "rnd3"), ("round 4--5", "rnd4"), ("not solved", "unsolved")]
+C_FAILURE_LABELS = {"failA": "compiler error", "failF": "other (link, forbidden construct)"}
 FAILURES = [("assembler error", "failA"), ("crash or timeout", "failB"),
             ("ABI or memory violation", "failC"), ("wrong values, larger sizes only", "failD"),
             ("wrong values, all sizes", "failE"), ("other (link, unfinished)", "failF")]
@@ -215,7 +216,10 @@ def main():
     fig_levels(rate, out_dir)
     fig_kernels(rate, [(k, labels[c]) for k, c in kernels], out_dir)
     stacked_panels(out_dir, "repair_rounds", [rounds], ROUND_BINS, "attempts (\\%)", 6)
-    stacked_panels(out_dir, "failures_by_level", failures, FAILURES, "attempts failing (\\%)", 3, rows=2,
+    bins = FAILURES
+    if any(c[0].get("mode") == "c" for c in cells):
+        bins = [(C_FAILURE_LABELS.get(code, label), code) for label, code in FAILURES]
+    stacked_panels(out_dir, "failures_by_level", failures, bins, "attempts failing (\\%)", 3, rows=2,
                    row_titles=["first try", "after repair"])
 
 
