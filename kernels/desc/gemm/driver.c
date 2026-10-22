@@ -25,7 +25,7 @@ int main(void)
         ABI_CALL(gemm, ni, nj, nk, alpha, beta, C, A, B);
         expect_abi();
 
-        expect_close("C", C, C_ref, ni * nj);
+        expect_close_2d("C", C, C_ref, ni, nj);
         expect_unchanged("A", A, A0, ni * nk);
         expect_unchanged("B", B, B0, nk * nj);
         expect_guards("C", C, ni * nj);

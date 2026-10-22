@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 
+from desc_repair import trajectories
 from gen_desc import cell_id, load_records, model_label
 from llm_client import API_KEY
 
@@ -46,6 +47,9 @@ def write_run_txt(run_dir, args):
         f"commit: {git('rev-parse', 'HEAD')}",
         f"dirty: {bool(git('status', '--porcelain', '--untracked-files=no'))}",
         f"host_avx2: {'avx2' in open('/proc/cpuinfo').read()}",
+        f"nonce: {not args.no_nonce}",
+        f"feedback: {args.feedback}",
+        f"start_from: {args.start_from}",
         f"args: {json.dumps(vars(args))}",
     ]
     with open(os.path.join(run_dir, "RUN.txt"), "a") as f:
@@ -69,11 +73,22 @@ def main():
     p.add_argument("--temperature", type=float)
     p.add_argument("--seed", type=int, help="same seed for every call")
     p.add_argument("--seed-per-repeat", action="store_true", help="use seed + repeat instead of the same seed")
+    p.add_argument("--no-nonce", action="store_true", help="no call-id in prompts and no gateway cache: identical cells send identical requests")
+    p.add_argument("--start-from", help="run dir: only cells that failed round 0 there, starting from that reply")
     args = p.parse_args()
     if not API_KEY:
         sys.exit("set RIVAULT_API_KEY first")
+    if args.start_from:
+        args.start_from = os.path.abspath(args.start_from)
 
     run_dir = os.path.join(ROOT, "results", args.run_id)
+    mixed = {(r.get("nonce", True), r.get("start_from")) for r in load_records(run_dir)} - {(not args.no_nonce, args.start_from)}
+    if mixed:
+        sys.exit(f"{args.run_id} already has cells with other settings (nonce, start_from) {mixed}; use a new --run-id")
+    todo = None
+    if args.start_from:
+        todo = {cell for cell, rounds in trajectories(load_records(args.start_from)).items()
+                if rounds[0]["stage"] not in ("pass", "no_answer")}
     log = os.path.join(run_dir, "calls", f"{args.shard}.jsonl") if args.shard else os.path.join(run_dir, "calls.jsonl")
     os.makedirs(os.path.dirname(log), exist_ok=True)
     write_run_txt(run_dir, args)
@@ -83,11 +98,13 @@ def main():
     cells = itertools.product(range(args.repeats), args.kernels, args.levels, args.models)
     for repeat, kernel, level, model in cells:
         cell = cell_id(kernel, level, model_label(model, args.reasoning_effort), repeat)
-        if cell in done:
+        if cell in done or (todo is not None and cell not in todo):
             continue
         subprocess.run([sys.executable, GEN, "--kernel", kernel, "--level", level,
                         "--model", model, "--run-dir", run_dir, "--repeat", str(repeat),
                         "--max-repairs", str(args.max_repairs), "--feedback", args.feedback, "--log", log]
+                       + (["--no-nonce"] if args.no_nonce else [])
+                       + (["--start-from", args.start_from] if args.start_from else [])
                        + (["--reasoning-effort", args.reasoning_effort] if args.reasoning_effort else [])
                        + (["--temperature", str(args.temperature)] if args.temperature is not None else [])
                        + (["--seed", str(args.seed + (repeat if args.seed_per_repeat else 0))] if args.seed is not None else []))

@@ -117,6 +117,7 @@ static void end(void)
     fflush(stdout);
 }
 
+#ifndef DESC_DIAG
 static void expect_close(const char *name, const double *got, const double *want, long n)
 {
     long wrong = 0;
@@ -132,6 +133,107 @@ static void expect_close(const char *name, const double *got, const double *want
     if (wrong)
         fail("%s: %ld/%ld wrong, max abs err %g", name, wrong, n, worst);
 }
+
+#define expect_close_2d(name, got, want, rows, cols) expect_close(name, got, want, (rows) * (cols))
+#define expect_close_3d(name, got, want, n0, n1, n2) expect_close(name, got, want, (n0) * (n1) * (n2))
+
+#else
+#include <signal.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+static void put(const char *s)
+{
+    if (write(1, s, strlen(s)) < 0)
+        return;
+}
+
+static void put_hex(unsigned long v)
+{
+    char buf[19] = "0x";
+    for (int i = 0; i < 16; i++)
+        buf[2 + i] = "0123456789abcdef"[(v >> (60 - 4 * i)) & 15];
+    buf[18] = 0;
+    put(buf);
+}
+
+static void on_fault(int sig, siginfo_t *info, void *context)
+{
+    unsigned long ip = ((ucontext_t *)context)->uc_mcontext.gregs[REG_RIP];
+    char num[3] = {(char)('0' + sig / 10), (char)('0' + sig % 10), 0};
+    put("\nfault signal=");
+    put(num);
+    put(" size=");
+    put(current_size ? current_size : "?");
+    put(" ip_from_tramp=");
+    put_hex(ip - (unsigned long)abi_tramp);
+    put(" addr=");
+    put_hex((unsigned long)info->si_addr);
+    put("\n");
+}
+
+__attribute__((constructor)) static void install_fault_handler(void)
+{
+    static char stack[1 << 16];
+    stack_t alt = {.ss_sp = stack, .ss_size = sizeof stack};
+    struct sigaction sa = {.sa_sigaction = on_fault, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND};
+    sigaltstack(&alt, 0);
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, 0);
+    sigaction(SIGBUS, &sa, 0);
+    sigaction(SIGILL, &sa, 0);
+    sigaction(SIGFPE, &sa, 0);
+}
+
+static long shape[3];
+static int rank;
+
+static void where(char *buf, size_t size, const char *name, long i)
+{
+    if (rank == 2)
+        snprintf(buf, size, "%s(%ld, %ld), flat index %ld", name, i / shape[1], i % shape[1], i);
+    else if (rank == 3)
+        snprintf(buf, size, "%s(%ld, %ld, %ld), flat index %ld", name, i / (shape[1] * shape[2]),
+                 i / shape[2] % shape[1], i % shape[2], i);
+    else
+        snprintf(buf, size, "%s[%ld]", name, i);
+}
+
+static void expect_close(const char *name, const double *got, const double *want, long n)
+{
+    long wrong = 0, first = -1;
+    double worst = 0;
+    char at[96];
+    for (long i = 0; i < n; i++) {
+        double err = fabs(got[i] - want[i]);
+        if (!(err <= RTOL * fabs(want[i]) + ATOL)) {
+            wrong++;
+            if (first < 0)
+                first = i;
+            if (!(err <= worst))
+                worst = err;
+        }
+    }
+    if (wrong) {
+        where(at, sizeof at, name, first);
+        fail("%s: %ld/%ld wrong, max abs err %g, first wrong element %s", name, wrong, n, worst, at);
+    }
+}
+
+static void expect_close_2d(const char *name, const double *got, const double *want, long rows, long cols)
+{
+    shape[0] = rows, shape[1] = cols, rank = 2;
+    expect_close(name, got, want, rows * cols);
+    rank = 0;
+}
+
+static void expect_close_3d(const char *name, const double *got, const double *want, long n0, long n1, long n2)
+{
+    shape[0] = n0, shape[1] = n1, shape[2] = n2, rank = 3;
+    expect_close(name, got, want, n0 * n1 * n2);
+    rank = 0;
+}
+#endif
 
 static void expect_unchanged(const char *name, const double *now, const double *before, long n)
 {

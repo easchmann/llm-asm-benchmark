@@ -42,9 +42,17 @@ static void expect_equal(const char *name, const long *got, const long *want, lo
                 first = i;
         }
     }
+#ifdef DESC_DIAG
+    char at[96];
+    if (wrong) {
+        where(at, sizeof at, name, first);
+        fail("%s: %ld/%ld wrong, first wrong element %s", name, wrong, n, at);
+    }
+#else
     if (wrong)
         fail("%s: %ld/%ld wrong, first at %ld: got %ld, want %ld",
              name, wrong, n, first, got[first], want[first]);
+#endif
 }
 
 static void iexpect_unchanged(const char *name, const long *now, const long *before, long n)

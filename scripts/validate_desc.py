@@ -10,7 +10,7 @@ import re
 import sys
 import tempfile
 
-from gen_desc import DESC, check, extract_asm
+from gen_desc import DESC, V2, check, crash_site, extract_asm, fail_lines, feedback_v2
 
 ASM = ".globl axpy\naxpy:\n    ret\n"
 REPLIES = [
@@ -58,16 +58,39 @@ def main():
         kernel = os.path.basename(kdir)
         stage, sizes, _, _ = check(hand, kdir, os.path.join(work, kernel))
         ok &= report(stage == "pass", f"{kernel} hand.S", f"{stage} {sizes}")
+        diag = check(hand, kdir, os.path.join(work, kernel + "_diag"), diag=True)[0]
+        ok &= report(diag == "pass", f"{kernel} hand.S ({V2})", diag)
         for mutant in sorted(glob.glob(os.path.join(kdir, "mutants", "*.S"))):
             name = os.path.basename(mutant)[:-2]
             stage, sizes, details, _ = check(mutant, kdir, os.path.join(work, f"{kernel}_{name}"))
             first = next((l for l in details.splitlines() if ": fail" in l), "")
             ok &= report(stage != "pass", f"{kernel} mutant {name}", f"{stage} {first}")
+            diag = check(mutant, kdir, os.path.join(work, f"{kernel}_{name}_diag"), diag=True)[0]
+            ok &= report(diag == stage, f"{kernel} mutant {name} ({V2})", diag)
 
     unfinished = os.path.join(work, "unfinished.S")
     open(unfinished, "w").write(".globl axpy\naxpy:\n    movq %rdi, %rax\n")
     stage = check(unfinished, os.path.join(DESC, "axpy"), os.path.join(work, "unfinished"))[0]
     ok &= report(stage == "incomplete", "answer without ret", stage)
+
+    axpy = os.path.join(DESC, "axpy")
+    hand = open(os.path.join(axpy, "hand.S")).read().replace("\naxpy:\n", "\naxpy:\n    xorl %eax, %eax\n    movq 8(%rax), %rax\n", 1)
+    line = hand.splitlines().index("    movq 8(%rax), %rax") + 1
+    crashing = os.path.join(work, "crashing.S")
+    open(crashing, "w").write(hand)
+    stage, _, details, _ = check(crashing, axpy, os.path.join(work, "crashing"), diag=True)
+    where, text = crash_site(details, crashing, axpy, os.path.join(work, "crashing"))
+    ok &= report(stage == "crash" and where == f"line {line}" and "address was 0x8." in text, "crash location", where)
+
+    gemm = os.path.join(DESC, "gemm")
+    details = check(os.path.join(gemm, "mutants", "skip_beta_scaling.S"), gemm, os.path.join(work, "gemm_wrong"), diag=True)[2]
+    ok &= report("first wrong element C(" in details, "first wrong element", next(iter(fail_lines(details)), ""))
+
+    broken = os.path.join(work, "broken.S")
+    open(broken, "w").write(".globl axpy\naxpy:\n    movq %rdi, %rax, %rbx\n    ret\n")
+    details = check(broken, axpy, os.path.join(work, "broken"), diag=True)[2]
+    note = feedback_v2("assemble_fail", details, open(broken).read(), "", [])
+    ok &= report("    3 | movq %rdi, %rax, %rbx" in note, "assembler error with source line", note.splitlines()[1])
 
     for label, reply, want in REPLIES:
         _, how = extract_asm(reply, "axpy")

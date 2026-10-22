@@ -24,7 +24,7 @@ int main(void)
         ABI_CALL(syrk, n, m, alpha, beta, C, A);
         expect_abi();
 
-        expect_close("C", C, C_ref, n * n);
+        expect_close_2d("C", C, C_ref, n, n);
         expect_unchanged("A", A, A0, n * m);
         expect_guards("C", C, n * n);
         expect_guards("A", A, n * m);

@@ -121,7 +121,7 @@ def resolve_model(alias, *, timeout=REQUEST_TIMEOUT, base_url=None, api_key=None
 
 def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
              base_url=None, api_key=None, temperature=None, top_p=None, seed=None,
-             reasoning_effort=None):
+             reasoning_effort=None, no_cache=False):
     """One chat/completions round trip, retrying transient gateway failures
     (504/502/503/429/timeouts) with exponential backoff.
 
@@ -130,6 +130,8 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
     temperature/top_p/seed to make the call deterministic / sweepable (Phase-1 decode
     tuning); whatever was actually sent is returned under sampling_params so every
     llm_calls.jsonl record self-describes its own sampling.
+    no_cache=True asks the LiteLLM gateway neither to serve nor to store a cached answer;
+    cache-related response headers are returned under cache_headers.
 
     Returns dict(content, underlying_model, usage, cost_usd, key_spend_total_usd,
                  finish_reason, elapsed_seconds, reasoning, sampling_params).
@@ -151,6 +153,8 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         body_dict["top_p"] = top_p
     if reasoning_effort is not None:
         body_dict["reasoning_effort"] = reasoning_effort
+    if no_cache:
+        body_dict["cache"] = {"no-cache": True, "no-store": True}
     body = json.dumps(body_dict).encode()
     req = urllib.request.Request(
         f"{base_url}/chat/completions", data=body,
@@ -206,6 +210,7 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         cost = to_float(http_resp.headers.get("X-Litellm-Response-Cost"))
         key_spend = to_float(http_resp.headers.get("X-Litellm-Key-Spend"))
         resolved_model = http_resp.headers.get("X-Litellm-Model-Name")
+        cache_headers = {k.lower(): v for k, v in http_resp.headers.items() if "cache" in k.lower()}
         try:
             resp = json.loads(http_resp.read())
         except Exception as e:
@@ -213,14 +218,14 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
                 raise _TransientError(LlmError(str(e),
                                                elapsed_seconds=round(time.time() - start, 1))) from e
             raise LlmError(str(e), elapsed_seconds=round(time.time() - start, 1)) from e
-        return resp, http_resp.status, cost, key_spend, resolved_model
+        return resp, http_resp.status, cost, key_spend, resolved_model, cache_headers
 
     last_err = None
     resp = None
     cost = key_spend = resolved_model = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            resp, status, cost, key_spend, resolved_model = run_once(attempt)
+            resp, status, cost, key_spend, resolved_model, cache_headers = run_once(attempt)
             break
         except LlmError as e:
             e.attempts = attempt + 1
@@ -259,6 +264,7 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         "elapsed_seconds": elapsed,
         "attempts": attempts,
         "reasoning": message.get("reasoning_content"),
+        "cache_headers": cache_headers,
         "sampling_params": {k: body_dict[k] for k in ("temperature", "top_p", "seed", "reasoning_effort")
                             if k in body_dict},
     }

@@ -24,8 +24,8 @@ int main(void)
         ABI_CALL(jacobi2d, tsteps, n, A, B);
         expect_abi();
 
-        expect_close("A", A, A_ref, cells);
-        expect_close("B", B, B_ref, cells);
+        expect_close_2d("A", A, A_ref, n, n);
+        expect_close_2d("B", B, B_ref, n, n);
         expect_guards("A", A, cells);
         expect_guards("B", B, cells);
         end();

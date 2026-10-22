@@ -36,7 +36,7 @@ int main(void)
         ABI_CALL(gemver, n, alpha, beta, A, u1, v1, u2, v2, w, x, y, z);
         expect_abi();
 
-        expect_close("A", A, A_ref, n * n);
+        expect_close_2d("A", A, A_ref, n, n);
         expect_close("x", x, x_ref, n);
         expect_close("w", w, w_ref, n);
         expect_unchanged("u1", u1, u10, n);

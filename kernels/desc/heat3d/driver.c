@@ -24,8 +24,8 @@ int main(void)
         ABI_CALL(heat3d, tsteps, n, A, B);
         expect_abi();
 
-        expect_close("A", A, A_ref, cells);
-        expect_close("B", B, B_ref, cells);
+        expect_close_3d("A", A, A_ref, n, n, n);
+        expect_close_3d("B", B, B_ref, n, n, n);
         expect_guards("A", A, cells);
         expect_guards("B", B, cells);
         end();

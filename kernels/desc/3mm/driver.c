@@ -32,7 +32,7 @@ int main(void)
         ABI_CALL(mm3, ni, nj, nk, nl, nm, E, A, B, F, C, D, G);
         expect_abi();
 
-        expect_close("G", G, G_ref, ni * nl);
+        expect_close_2d("G", G, G_ref, ni, nl);
         expect_unchanged("A", A, A0, ni * nk);
         expect_unchanged("B", B, B0, nk * nj);
         expect_unchanged("C", C, C0, nj * nm);
