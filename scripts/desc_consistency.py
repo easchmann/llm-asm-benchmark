@@ -7,6 +7,7 @@ import collections
 
 from desc_repair import trajectories
 from gen_desc import load_records
+from md import heading, table
 
 
 def pct(k, n):
@@ -50,15 +51,13 @@ def main():
 
     header = ["model", "tasks", "identical code", "same stage", "same pass/fail", f"stable (<= {args.max_disagree} differ)",
               "pass rate (all runs)", "majority pass", "all runs pass"]
-    print("| " + " | ".join(header) + " |")
-    print("|" + "---|" * len(header))
-    for row in rows:
-        print("| " + " | ".join(str(c) for c in row) + " |")
+    heading("Consistency of the runs per model-task pair (first try)")
+    table(header, rows)
 
     if args.list:
-        print("\nnot stable:")
-        for (model, kernel, level), passed, stages in sorted(unstable):
-            print(f"  {model:<36} {kernel:<12} {level}  {passed:<10} {stages}")
+        heading("Tasks that are not stable")
+        table(["model", "kernel", "level", "passed", "stages seen"],
+              [[model, kernel, level, passed, stages] for (model, kernel, level), passed, stages in sorted(unstable)])
 
 
 if __name__ == "__main__":

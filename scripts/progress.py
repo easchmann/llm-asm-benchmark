@@ -10,6 +10,7 @@ import os
 import time
 
 from gen_desc import load_records
+from md import heading, table
 
 
 def shards_per_model(run_dir):
@@ -36,7 +37,7 @@ def main():
     for r in records:
         by_model[r["model"]].append(r)
 
-    print(f"{'model':<36}{'done':>10}{'calls':>7}{'cost':>9}{'API err (last 30)':>19}{'s/cell':>8}{'ETA':>10}  last record")
+    rows = []
     for model, recs in sorted(by_model.items()):
         final = {r["cell"]: r for r in recs if r.get("stop_reason") and not (r["stop_reason"] == "api_error" and r["round"] == 0)}
         cost = sum(r.get("cost_usd") or 0 for r in recs)
@@ -47,9 +48,11 @@ def main():
         remaining = max(expected - len(final), 0)
         eta_h = remaining * per_cell / max(len(shards.get(model, ())), 1) / 3600
         last = max((r.get("time") or "" for r in recs), default="")
-        print(f"{model:<36}{f'{len(final)}/{expected}':>10}{len(recs):>7}{'$%.2f' % cost:>9}{api_err:>18.0%}"
-              f"{per_cell:>8.0f}{f'{eta_h:.1f} h':>10}  {last[5:16].replace('T', ' ')}")
-    print(f"\ntotal cost ${sum(r.get('cost_usd') or 0 for r in records):.2f}, now {time.strftime('%m-%d %H:%M')}")
+        rows.append([model, f"{len(final)}/{expected}", len(recs), f"${cost:.2f}", f"{api_err:.0%}",
+                     f"{per_cell:.0f}", f"{eta_h:.1f} h", last[5:16].replace("T", " ")])
+    heading(f"Progress of {args.run_dir} at {time.strftime('%m-%d %H:%M')}")
+    table(["model", "done", "calls", "cost", "API errors (last 30)", "s per cell", "remaining", "last record"], rows)
+    print(f"Total cost: ${sum(r.get('cost_usd') or 0 for r in records):.2f}")
 
 
 if __name__ == "__main__":

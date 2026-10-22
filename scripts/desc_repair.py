@@ -6,6 +6,7 @@ import argparse
 import collections
 
 from gen_desc import load_records
+from md import heading, table
 
 ORDER = ["extract_fail", "incomplete", "assemble_fail", "link_fail", "crash", "timeout", "wrong", "pass"]
 RANK = {s: i for i, s in enumerate(ORDER)}
@@ -85,34 +86,32 @@ def main():
         groups[group_key(rounds, args.by)].append(rounds)
     max_round = max((len(r) - 1 for r in cells.values()), default=0)
 
-    print("cumulative pass rate by round (cells with an answer in round 0)")
-    print(f"{'group':<44}{'cells':>6}" + "".join(f"{'r' + str(k):>7}" for k in range(max_round + 1)))
-    for key, cell_rounds in sorted(groups.items(), key=lambda kv: str(kv[0])):
+    name = lambda key: " / ".join(key) if isinstance(key, tuple) else key
+    ordered = sorted(groups.items(), key=lambda kv: str(kv[0]))
+
+    heading("Cumulative pass rate by round (cells with an answer in round 0)")
+    rows = []
+    for key, cell_rounds in ordered:
         answered = [rs for rs in cell_rounds if rs[0]["stage"] != "no_answer"]
-        if not answered:
-            continue
-        row = []
-        for k in range(max_round + 1):
-            passed = sum(any(r["stage"] == "pass" and r["round"] <= k for r in rs) for rs in answered)
-            row.append(f"{100 * passed / len(answered):6.0f}%")
-        print(f"{str(key):<44}{len(answered):>6}" + " ".join(row))
+        if answered:
+            rows.append([name(key), len(answered)] +
+                        [f"{100 * sum(any(r['stage'] == 'pass' and r['round'] <= k for r in rs) for rs in answered) / len(answered):.0f}%"
+                         for k in range(max_round + 1)])
+    table([args.by, "cells"] + [f"r{k}" for k in range(max_round + 1)], rows)
 
-    print("\ntrajectory classes")
-    print(f"{'group':<44}" + "".join(f"{c[:11]:>12}" for c in CLASSES))
-    for key, cell_rounds in sorted(groups.items(), key=lambda kv: str(kv[0])):
-        counts = collections.Counter(classify(rs) for rs in cell_rounds)
-        print(f"{str(key):<44}" + "".join(f"{counts[c]:>12}" for c in CLASSES))
+    heading("Trajectory classes")
+    table([args.by] + CLASSES, [[name(key)] + [collections.Counter(classify(rs) for rs in cell_rounds)[c] for c in CLASSES]
+                                for key, cell_rounds in ordered])
 
-    print("\nstage transitions between consecutive rounds (all cells)")
+    heading("Stage transitions between consecutive rounds (all cells)")
     moves = collections.Counter()
     for rounds in cells.values():
         for a, b in zip(rounds, rounds[1:]):
             moves[(a["stage"], b["stage"])] += 1
-    for (a, b), n in moves.most_common(20):
-        print(f"  {a:>14} -> {b:<14}{n:>6}")
+    table(["from", "to", "count"], [[a, b, n] for (a, b), n in moves.most_common(20)])
 
-    print("\nrepair cost per model")
-    print(f"{'model':<44}{'fixed':>7}{'mean round':>12}{'repair calls':>14}{'repair cost':>13}{'per fix':>10}")
+    heading("Repair cost per model")
+    rows = []
     by_model = collections.defaultdict(list)
     for rounds in cells.values():
         by_model[rounds[0]["model"]].append(rounds)
@@ -122,10 +121,12 @@ def main():
         cost = sum(r.get("cost_usd") or 0 for r in repair)
         mean_round = sum(rs[-1]["round"] for rs in fixed) / len(fixed) if fixed else 0
         per_fix = f"${cost / len(fixed):.4f}" if fixed else "-"
-        print(f"{model:<44}{len(fixed):>7}{mean_round:>12.1f}{len(repair):>14}{'$%.3f' % cost:>13}{per_fix:>10}")
+        rows.append([model, len(fixed), f"{mean_round:.1f}", len(repair), f"${cost:.3f}", per_fix])
+    table(["model", "fixed", "mean round", "repair calls", "repair cost", "cost per fix"], rows)
 
+    heading("Stop reasons")
     stops = collections.Counter(rs[-1].get("stop_reason") for rs in cells.values())
-    print("\nstop reasons:", dict(stops))
+    table(["stop reason", "cells"], [[s, n] for s, n in stops.most_common()])
 
 
 if __name__ == "__main__":

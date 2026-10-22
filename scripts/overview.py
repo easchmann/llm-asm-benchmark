@@ -7,18 +7,11 @@ import sys
 
 from desc_repair import CATEGORY, ORDER, trajectories
 from gen_desc import load_records
+from md import heading, table
 
 
 def pct(k, n):
     return f"{100 * k / n:.0f}%" if n else "-"
-
-
-def print_table(header, rows):
-    print("| " + " | ".join(header) + " |")
-    print("|" + "---|" * len(header))
-    for row in rows:
-        print("| " + " | ".join(str(c) for c in row) + " |")
-    print()
 
 
 def summary(cells):
@@ -37,11 +30,13 @@ for rs in cells:
     groups["level", r["model"], r["level"]].append(rs)
     groups["category", r["model"], CATEGORY.get(r["kernel"], "other")].append(rs)
 
-print_table(["model", "cells", "no answer", "pass first try", "pass after repair", "cost"],
+heading("Per model")
+table(["model", "cells", "no answer", "pass first try", "pass after repair", "cost"],
             [[k[1]] + summary(v) for k, v in sorted(groups.items()) if k[0] == "all"])
 
 for name in ("level", "category"):
-    print_table(["model", name, "cells", "no answer", "pass first try", "pass after repair", "cost"],
+    heading(f"Per model and {name}")
+    table(["model", name, "cells", "no answer", "pass first try", "pass after repair", "cost"],
                 [[k[1], k[2]] + summary(v) for k, v in sorted(groups.items()) if k[0] == name])
 
 stages = [s for s in ORDER if s != "pass"]
@@ -50,6 +45,5 @@ for k, v in sorted(groups.items()):
     if k[0] == "all":
         final = collections.Counter(rs[-1]["stage"] for rs in v)
         rows.append([k[1]] + [final[s] for s in stages])
-print("final stage of cells that did not pass")
-print()
-print_table(["model"] + stages, rows)
+heading("Final stage of cells that did not pass")
+table(["model"] + stages, rows)

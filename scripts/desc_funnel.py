@@ -7,6 +7,7 @@ import math
 import sys
 
 from gen_desc import load_records
+from md import heading, table
 
 STAGES = ["no_answer", "extract_fail", "incomplete", "assemble_fail", "link_fail", "crash", "timeout", "wrong", "pass"]
 
@@ -35,26 +36,29 @@ def main():
     for r in final.values():
         stages[(r["model"], r["level"])][r["stage"]] += 1
 
-    print(f"{'model':<32}{'level':<6}" + "".join(f"{s[:8]:>9}" for s in STAGES) + "   pass rate")
-    for (model, level), c in sorted(stages.items()):
-        n = sum(c.values())
-        print(f"{model:<32}{level:<6}" + "".join(f"{c[s]:>9}" for s in STAGES) + f"   {rate(c['pass'], n)}")
+    heading("Final stage per model and level")
+    table(["model", "level"] + STAGES + ["pass rate"],
+          [[model, level] + [c[s] for s in STAGES] + [rate(c["pass"], sum(c.values()))]
+           for (model, level), c in sorted(stages.items())])
 
-    print("\nper level")
+    heading("Per level")
+    rows = []
     for level in sorted({r["level"] for r in final.values()}):
         cells = [r for r in final.values() if r["level"] == level]
         passed = sum(r["stage"] == "pass" for r in cells)
         r0 = sum(r["cell"] in first_try for r in cells)
-        print(f"{level:<6} final {rate(passed, len(cells)):<22} first try {rate(r0, len(cells))}")
+        rows.append([level, rate(r0, len(cells)), rate(passed, len(cells))])
+    table(["level", "first try", "final"], rows)
 
-    print("\nper model")
+    heading("Per model")
     cost = collections.Counter()
     for r in records:
         cost[r["model"]] += r.get("cost_usd") or 0
+    rows = []
     for model in sorted(cost):
         passed = sum(r["stage"] == "pass" for r in final.values() if r["model"] == model)
-        per_pass = f"${cost[model] / passed:.4f}" if passed else "-"
-        print(f"{model:<32} passes {passed:<4} cost ${cost[model]:.4f}  per pass {per_pass}")
+        rows.append([model, passed, f"${cost[model]:.4f}", f"${cost[model] / passed:.4f}" if passed else "-"])
+    table(["model", "passes", "cost", "cost per pass"], rows)
 
 
 if __name__ == "__main__":
