@@ -75,7 +75,7 @@ def pct(k, n):
 
 def classify(r):
     stage = r["stage"]
-    if stage == "assemble_fail":
+    if stage in ("assemble_fail", "compile_fail"):
         return "failA"
     if stage in ("crash", "timeout"):
         return "failB"

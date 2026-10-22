@@ -8,7 +8,9 @@ import collections
 from gen_desc import load_records
 from md import heading, table
 
-ORDER = ["extract_fail", "incomplete", "assemble_fail", "link_fail", "crash", "timeout", "wrong", "pass"]
+ORDER = ["extract_fail", "forbidden", "incomplete", "compile_fail", "assemble_fail", "link_fail", "crash", "timeout",
+         "wrong", "pass"]
+C_STAGES = ("forbidden", "compile_fail")
 RANK = {s: i for i, s in enumerate(ORDER)}
 CLASSES = ["first try", "fixed", "progressing", "oscillating", "stuck", "regressing", "interrupted",
            "not repaired", "no answer"]

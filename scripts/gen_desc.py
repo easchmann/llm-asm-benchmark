@@ -3,6 +3,7 @@
 # usage: python3 scripts/gen_desc.py --kernel atax --level L2 --model Qwen/Qwen3.8-27B --run-dir results/desc_test
 #        --reply-file reply.txt uses a saved reply instead of calling the API
 #        --start-from results/desc_full takes round 0 from that run's saved reply for the same cell
+#        --target c asks for C instead of assembly (baseline: same task, compiled with gcc -O2)
 
 import argparse
 import hashlib
@@ -23,18 +24,26 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DESC = os.path.join(ROOT, "kernels", "desc")
 PROMPT = os.path.join(ROOT, "prompts", "desc_x86_64.txt")
 REPAIR = os.path.join(ROOT, "prompts", "desc_repair.txt")
+C_PROMPT = os.path.join(ROOT, "prompts", "desc_c.txt")
+C_REPAIR = os.path.join(ROOT, "prompts", "desc_c_repair.txt")
 
 THINK_RE = re.compile(r"<\s*(?:\w+:)?think(?:ing)?\s*>.*?<\s*/\s*(?:\w+:)?think(?:ing)?\s*>", re.S | re.I)
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
 SIZE_RE = re.compile(r"^size (\S+): (pass|fail)", re.M)
 ERR_RE = re.compile(r"Error:|error:|undefined reference")
 RET_RE = re.compile(r"^\s*(?:[\w.]+:\s*)?(?:rep\s+|repz\s+)?ret[qlw]?\b", re.M)
+COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
+FORBIDDEN = [(re.compile(r"\b(?:__asm__|__asm|asm)\b"), "inline assembly"),
+             (re.compile(r"#\s*include\s*[<\"][^>\"]*intrin\.h"), "an intrinsics header"),
+             (re.compile(r"\bmain\s*\("), "a main function")]
 TIMEOUT_SIGNALS = {signal.SIGXCPU, signal.SIGKILL}
 FAULT_RE = re.compile(r"^fault signal=(\d+) size=(\S+) ip_from_tramp=(0x[0-9a-f]+) addr=(0x[0-9a-f]+)\n?", re.M)
 LINE_RE = re.compile(r"^line (\d+)\b")
 V2 = "compile+tests+v2"
 STAGE_WORDS = {"extract_fail": "no function found", "incomplete": "no ret instruction",
-               "assemble_fail": "did not assemble", "link_fail": "did not link", "crash": "crashed",
+               "forbidden": "used something the requirements forbid",
+               "assemble_fail": "did not assemble", "compile_fail": "did not compile",
+               "link_fail": "did not link", "crash": "crashed",
                "timeout": "did not finish in time", "wrong": "wrong results"}
 
 
@@ -76,26 +85,38 @@ def load_kernel(kernel, level):
     return kdir, spec, description
 
 
-def build_prompt(spec, description):
-    return fill(PROMPT, {"NAME": spec["name"], "SIGNATURE": spec["signature"],
-                         "LAYOUT": spec["layout"], "DESCRIPTION": description})
+def build_prompt(spec, description, template=PROMPT):
+    return fill(template, {"NAME": spec["name"], "SIGNATURE": spec["signature"],
+                           "LAYOUT": spec["layout"], "DESCRIPTION": description})
+
+
+def extract_code(reply, wanted, missing):
+    text = THINK_RE.sub("", reply)
+    blocks = [b for b in FENCE_RE.findall(text) if wanted.search(b)]
+    if blocks:
+        return blocks[-1], "fenced" if len(blocks) == 1 else f"last_of_{len(blocks)}_blocks"
+    if wanted.search(text):
+        return text, "unfenced"
+    return None, missing
 
 
 def extract_asm(reply, name):
-    text = THINK_RE.sub("", reply)
-    globl = re.compile(r"\.globa?l\s+" + re.escape(name) + r"\b")
-    blocks = [b for b in FENCE_RE.findall(text) if globl.search(b)]
-    if blocks:
-        return blocks[-1], "fenced" if len(blocks) == 1 else f"last_of_{len(blocks)}_blocks"
-    if globl.search(text):
-        return text, "unfenced"
-    return None, "no_globl"
+    return extract_code(reply, re.compile(r"\.globa?l\s+" + re.escape(name) + r"\b"), "no_globl")
+
+
+def extract_c(reply, name):
+    return extract_code(reply, re.compile(r"\b" + re.escape(name) + r"\s*\([^;{]*\)\s*\{"), "no_definition")
+
+
+def forbidden(c_source):
+    text = COMMENT_RE.sub(" ", c_source)
+    return [what for pattern, what in FORBIDDEN if pattern.search(text)]
 
 
 def error_lines(stderr, limit=20):
     seen = []
     for line in stderr.splitlines():
-        line = re.sub(r"^[^\s:]+:(\d+):", r"line \1:", line)
+        line = re.sub(r"^[^\s:]+:(\d+):(?:\d+:)?", r"line \1:", line)
         line = re.sub(r"^\S+\.o:\s*", "", line)
         if ERR_RE.search(line) and line not in seen:
             seen.append(line)
@@ -105,9 +126,10 @@ def error_lines(stderr, limit=20):
 def build(asm_path, kdir, exe, diag=False, debug=False):
     obj = exe + ".o"
     g = ["-g"] if debug else []
-    r = subprocess.run(["gcc", *g, "-c", asm_path, "-o", obj], capture_output=True, text=True)
+    c = asm_path.endswith(".c")
+    r = subprocess.run(["gcc", *g, *(["-O2"] if c else []), "-c", asm_path, "-o", obj], capture_output=True, text=True)
     if r.returncode:
-        return "assemble_fail", r.stderr
+        return "compile_fail" if c else "assemble_fail", r.stderr
     flags = g + (["-DDESC_DIAG", "-D_GNU_SOURCE"] if diag else [])
     r = subprocess.run(["gcc", "-O2", *flags, "-I", os.path.join(DESC, "common"),
                         os.path.join(kdir, "driver.c"), os.path.join(kdir, "ref.c"),
@@ -134,7 +156,13 @@ def run(exe):
 
 
 def check(asm_path, kdir, exe, diag=False):
-    if not RET_RE.search(open(asm_path).read()):
+    source = open(asm_path).read()
+    if asm_path.endswith(".c"):
+        found = forbidden(source)
+        if found:
+            return "forbidden", {}, (f"Your answer contains {' and '.join(found)}, which the requirements do not allow. "
+                                     "Write the function in plain C."), {}
+    elif not RET_RE.search(source):
         return "incomplete", {}, "The function contains no ret instruction; the answer looks unfinished.", {}
     stage, log = build(asm_path, kdir, exe, diag)
     if stage:
@@ -201,9 +229,9 @@ def fail_lines(details, limit=5):
 def feedback(stage, details, mode):
     if mode == "none":
         return None
-    if stage in ("extract_fail", "incomplete"):
+    if stage in ("extract_fail", "incomplete", "forbidden"):
         return details
-    if stage in ("assemble_fail", "link_fail"):
+    if stage in ("assemble_fail", "compile_fail", "link_fail"):
         return "Your code did not build:\n" + "\n".join(error_lines(details))
     if mode == "compile+tests" and stage in ("wrong", "crash", "timeout"):
         return f"Your code built but failed the tests ({stage}). Test output:\n{details[:4000]}"
@@ -223,9 +251,9 @@ def history_line(rec):
 def feedback_v2(stage, details, asm, crash_text, history):
     if stage == "pass":
         return None
-    if stage in ("extract_fail", "incomplete"):
+    if stage in ("extract_fail", "incomplete", "forbidden"):
         note = details
-    elif stage in ("assemble_fail", "link_fail"):
+    elif stage in ("assemble_fail", "compile_fail", "link_fail"):
         lines = (asm or "").splitlines()
         out = []
         for error in error_lines(details):
@@ -270,6 +298,8 @@ def main():
     p.add_argument("--temperature", type=float)
     p.add_argument("--seed", type=int)
     p.add_argument("--reasoning-effort", help="e.g. none: passed to the gateway, cells get a separate label")
+    p.add_argument("--target", choices=["asm", "c"], default="asm", help="c: the model writes C, compiled with gcc -O2")
+    p.add_argument("--base-model", help="the model behind an alias such as RiVault/Reasoning-Medium, logged as base_model")
     p.add_argument("--no-nonce", action="store_true", help="no call-id in the prompt and no gateway cache")
     p.add_argument("--reply-file")
     p.add_argument("--start-from", help="run dir whose saved round-0 reply for this cell replaces the first call")
@@ -294,7 +324,8 @@ def main():
     os.makedirs(raw_dir, exist_ok=True)
     log = args.log or os.path.join(args.run_dir, "calls.jsonl")
 
-    base = build_prompt(spec, description)
+    c = args.target == "c"
+    base = build_prompt(spec, description, C_PROMPT if c else PROMPT)
     prompt, prev_sig = base, None
     for rnd in range(args.max_repairs + 1):
         tag = f"{cell}.r{rnd}"
@@ -302,7 +333,8 @@ def main():
                "run": os.path.basename(os.path.normpath(args.run_dir)), "cell": cell,
                "kernel": args.kernel, "level": args.level, "model": label,
                "api_model": args.model, "reasoning_effort": args.reasoning_effort,
-               "repeat": args.repeat, "round": rnd, "feedback": args.feedback if rnd else None,
+               "base_model": args.base_model or args.model, "repeat": args.repeat, "round": rnd,
+               "mode": "c" if c else "direct", "feedback": args.feedback if rnd else None,
                "feedback_mode": args.feedback, "nonce": not args.no_nonce, "start_from": args.start_from,
                "prompt_sha": sha(prompt)}
         try:
@@ -323,19 +355,20 @@ def main():
         if r.get("reasoning"):
             save(os.path.join(raw_dir, tag + ".reasoning.txt"), r["reasoning"])
 
-        asm, how = extract_asm(r["content"], spec["name"])
+        asm, how = (extract_c if c else extract_asm)(r["content"], spec["name"])
         rec["extract_reason"] = how
         if asm is None:
-            stage, sizes, details, info = "extract_fail", {}, f"Your answer contained no .globl {spec['name']}.", {}
+            missing = f"no definition of {spec['name']}" if c else f"no .globl {spec['name']}"
+            stage, sizes, details, info = "extract_fail", {}, f"Your answer contained {missing}.", {}
         else:
-            asm_path = os.path.join(code_dir, tag + ".S")
+            asm_path = os.path.join(code_dir, tag + (".c" if c else ".S"))
             save(asm_path, asm.rstrip() + "\n")
             rec["asm_sha"] = sha(asm)
             stage, sizes, details, info = check(asm_path, kdir, os.path.join(code_dir, tag), diag)
         crash_where, crash_text = (crash_site(details, asm_path, kdir, os.path.join(code_dir, tag))
                                    if diag and stage == "crash" else (None, ""))
 
-        errors = error_lines(details) if stage in ("assemble_fail", "link_fail") else []
+        errors = error_lines(details) if stage in ("assemble_fail", "compile_fail", "link_fail") else []
         failures = fail_lines(details) if stage in ("wrong", "crash", "timeout") else []
         shape = [re.sub(r"[-\d.e+]+", "#", l) for l in failures]
         sig = sha(stage + "\n".join(sorted(errors)) + "\n".join(shape) + json.dumps(sizes, sort_keys=True))
@@ -366,7 +399,7 @@ def main():
             return
 
         prev_sig = sig
-        prompt = base + "\n\n" + fill(REPAIR, {"ASM": asm or r["content"][:8000], "FEEDBACK": note})
+        prompt = base + "\n\n" + fill(C_REPAIR if c else REPAIR, {"ASM": asm or r["content"][:8000], "FEEDBACK": note})
 
 
 if __name__ == "__main__":

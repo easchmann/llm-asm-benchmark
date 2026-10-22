@@ -3,6 +3,7 @@
 # usage: python3 scripts/run_desc.py --run-id desc_pilot --models Qwen/Qwen3.8-27B zai-org/GLM-5.3-Flash \
 #            --kernels axpy atax --levels L0 L2 L3 --repeats 2 [--shard name]
 # with --shard, this process logs to <run>/calls/<name>.jsonl, so several processes can share one run
+# --target c: the model writes C instead of assembly (baseline)
 
 import argparse
 import itertools
@@ -50,6 +51,8 @@ def write_run_txt(run_dir, args):
         f"nonce: {not args.no_nonce}",
         f"feedback: {args.feedback}",
         f"start_from: {args.start_from}",
+        f"target: {args.target}",
+        f"base_model: {args.base_model or ', '.join(args.models)}",
         f"args: {json.dumps(vars(args))}",
     ]
     with open(os.path.join(run_dir, "RUN.txt"), "a") as f:
@@ -66,6 +69,8 @@ def main():
     p.add_argument("--max-repairs", type=int, default=0)
     p.add_argument("--feedback", default="none")
     p.add_argument("--reasoning-effort", help="e.g. none: passed to the gateway, cells get a separate label")
+    p.add_argument("--target", choices=["asm", "c"], default="asm", help="c: the model writes C, compiled with gcc -O2")
+    p.add_argument("--base-model", help="the model behind an alias such as RiVault/Reasoning-Medium, logged as base_model")
     p.add_argument("--max-errors", type=int, default=5, help="API errors in a row before pausing")
     p.add_argument("--pause", type=int, default=900, help="seconds to wait after --max-errors")
     p.add_argument("--max-pauses", type=int, default=3, help="pauses in a row before stopping")
@@ -82,9 +87,11 @@ def main():
         args.start_from = os.path.abspath(args.start_from)
 
     run_dir = os.path.join(ROOT, "results", args.run_id)
-    mixed = {(r.get("nonce", True), r.get("start_from")) for r in load_records(run_dir)} - {(not args.no_nonce, args.start_from)}
+    mode = "c" if args.target == "c" else "direct"
+    mixed = ({(r.get("nonce", True), r.get("start_from"), r.get("mode", "direct")) for r in load_records(run_dir)}
+             - {(not args.no_nonce, args.start_from, mode)})
     if mixed:
-        sys.exit(f"{args.run_id} already has cells with other settings (nonce, start_from) {mixed}; use a new --run-id")
+        sys.exit(f"{args.run_id} already has cells with other settings (nonce, start_from, mode) {mixed}; use a new --run-id")
     todo = None
     if args.start_from:
         todo = {cell for cell, rounds in trajectories(load_records(args.start_from)).items()
@@ -104,6 +111,8 @@ def main():
                         "--model", model, "--run-dir", run_dir, "--repeat", str(repeat),
                         "--max-repairs", str(args.max_repairs), "--feedback", args.feedback, "--log", log]
                        + (["--no-nonce"] if args.no_nonce else [])
+                       + (["--target", args.target] if args.target != "asm" else [])
+                       + (["--base-model", args.base_model] if args.base_model else [])
                        + (["--start-from", args.start_from] if args.start_from else [])
                        + (["--reasoning-effort", args.reasoning_effort] if args.reasoning_effort else [])
                        + (["--temperature", str(args.temperature)] if args.temperature is not None else [])

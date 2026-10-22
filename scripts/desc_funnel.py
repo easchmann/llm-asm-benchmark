@@ -6,10 +6,12 @@ import collections
 import math
 import sys
 
+from desc_repair import C_STAGES
 from gen_desc import load_records
 from md import heading, table
 
-STAGES = ["no_answer", "extract_fail", "incomplete", "assemble_fail", "link_fail", "crash", "timeout", "wrong", "pass"]
+STAGES = ["no_answer", "extract_fail", "forbidden", "incomplete", "compile_fail", "assemble_fail", "link_fail", "crash",
+          "timeout", "wrong", "pass"]
 
 
 def wilson(k, n, z=1.96):
@@ -36,9 +38,10 @@ def main():
     for r in final.values():
         stages[(r["model"], r["level"])][r["stage"]] += 1
 
+    shown = [s for s in STAGES if s not in C_STAGES or any(r["stage"] == s for r in final.values())]
     heading("Final stage per model and level")
-    table(["model", "level"] + STAGES + ["pass rate"],
-          [[model, level] + [c[s] for s in STAGES] + [rate(c["pass"], sum(c.values()))]
+    table(["model", "level"] + shown + ["pass rate"],
+          [[model, level] + [c[s] for s in shown] + [rate(c["pass"], sum(c.values()))]
            for (model, level), c in sorted(stages.items())])
 
     heading("Per level")

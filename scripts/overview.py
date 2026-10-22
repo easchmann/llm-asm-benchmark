@@ -5,7 +5,7 @@
 import collections
 import sys
 
-from desc_repair import CATEGORY, ORDER, trajectories
+from desc_repair import C_STAGES, CATEGORY, ORDER, trajectories
 from gen_desc import load_records
 from md import heading, table
 
@@ -39,7 +39,8 @@ for name in ("level", "category"):
     table(["model", name, "cells", "no answer", "pass first try", "pass after repair", "cost"],
                 [[k[1], k[2]] + summary(v) for k, v in sorted(groups.items()) if k[0] == name])
 
-stages = [s for s in ORDER if s != "pass"]
+used = {rs[-1]["stage"] for rs in cells}
+stages = [s for s in ORDER if s != "pass" and (s not in C_STAGES or s in used)]
 rows = []
 for k, v in sorted(groups.items()):
     if k[0] == "all":

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # check the harness before spending API money: hand-written solutions pass,
-# mutants fail, and the extractor handles typical reply shapes
+# mutants fail, and the extractor handles typical reply shapes; the same for the C target (ref.c as answer)
 # usage: python3 scripts/validate_desc.py
 
 import glob
@@ -10,7 +10,7 @@ import re
 import sys
 import tempfile
 
-from gen_desc import DESC, V2, check, crash_site, extract_asm, fail_lines, feedback_v2
+from gen_desc import DESC, V2, check, crash_site, extract_asm, extract_c, fail_lines, feedback_v2
 
 ASM = ".globl axpy\naxpy:\n    ret\n"
 REPLIES = [
@@ -21,6 +21,14 @@ REPLIES = [
     ("two blocks", f"```asm\n{ASM}```\nFixed:\n```asm\n{ASM}```", "last_of_2_blocks"),
     ("unfenced", ASM, "unfenced"),
     ("no globl", "```asm\nfoo:\n    ret\n```", "no_globl"),
+]
+C = "void axpy(long n, double a, const double *x, double *y)\n{\n}\n"
+C_REPLIES = [
+    ("fenced", f"```c\n{C}```", "fenced"),
+    ("think then fence", f"<think>draft\n```c\n{C}```\n</think>\n```c\n{C}```", "fenced"),
+    ("two blocks", f"```c\n{C}```\nFixed:\n```c\n{C}```", "last_of_2_blocks"),
+    ("prototype only", "```c\nvoid axpy(long n, double a, const double *x, double *y);\n```", "no_definition"),
+    ("other function", "```c\nvoid ref_axpy(long n)\n{\n}\n```", "no_definition"),
 ]
 
 
@@ -68,6 +76,33 @@ def main():
             diag = check(mutant, kdir, os.path.join(work, f"{kernel}_{name}_diag"), diag=True)[0]
             ok &= report(diag == stage, f"{kernel} mutant {name} ({V2})", diag)
 
+    for ref in sorted(glob.glob(os.path.join(DESC, "*", "ref.c"))):
+        kdir = os.path.dirname(ref)
+        kernel = os.path.basename(kdir)
+        name = json.load(open(os.path.join(kdir, "spec.json")))["name"]
+        answer, how = extract_c("```c\n" + re.sub(r"\bref_\w+(?=\s*\()", name, open(ref).read()) + "```", name)
+        path = os.path.join(work, kernel + ".c")
+        open(path, "w").write(answer)
+        stage, sizes, _, _ = check(path, kdir, os.path.join(work, kernel + "_c"), diag=True)
+        ok &= report(how == "fenced" and stage == "pass", f"{kernel} ref.c as C answer", f"{how} {stage} {sizes}")
+
+    axpy_c = open(os.path.join(DESC, "axpy", "ref.c")).read().replace("ref_axpy", "axpy")
+    for label, source, want in [
+        ("inline assembly", axpy_c.replace("{", "{\n    __asm__(\"nop\");", 1), "forbidden"),
+        ("intrinsics header", "#include <immintrin.h>\n" + axpy_c, "forbidden"),
+        ("main function", axpy_c + "\nint main(void)\n{\n    return 0;\n}\n", "forbidden"),
+        ("asm only in a comment", "/* no asm, no main() */\n#include <math.h>\n" + axpy_c, "pass"),
+        ("compiler error", axpy_c.replace("{", "{\n    undeclared++;", 1), "compile_fail"),
+    ]:
+        path = os.path.join(work, "axpy_" + label.replace(" ", "_") + ".c")
+        open(path, "w").write(source)
+        stage, _, details, _ = check(path, os.path.join(DESC, "axpy"), path[:-2], diag=True)
+        ok &= report(stage == want, f"C answer with {label}", stage)
+        if stage == "compile_fail":
+            note = feedback_v2(stage, details, source, "", [])
+            ok &= report("line 3: error: " in note and "    3 | undeclared++;" in note,
+                         "compiler error with source line", " / ".join(note.splitlines()[1:3]))
+
     unfinished = os.path.join(work, "unfinished.S")
     open(unfinished, "w").write(".globl axpy\naxpy:\n    movq %rdi, %rax\n")
     stage = check(unfinished, os.path.join(DESC, "axpy"), os.path.join(work, "unfinished"))[0]
@@ -95,6 +130,9 @@ def main():
     for label, reply, want in REPLIES:
         _, how = extract_asm(reply, "axpy")
         ok &= report(how == want, f"extract {label}", how)
+    for label, reply, want in C_REPLIES:
+        _, how = extract_c(reply, "axpy")
+        ok &= report(how == want, f"extract C {label}", how)
 
     print("\nall good" if ok else "\nproblems found")
     sys.exit(0 if ok else 1)
