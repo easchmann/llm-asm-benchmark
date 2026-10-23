@@ -3,7 +3,7 @@
 # pass rates with on - off and a 95% CI (bootstrap over kernels), failure mix, tokens, time and cost per cell
 # usage: python3 scripts/desc_thinking.py results/desc_full results/desc_thinking [--pair OFF ON ...]
 # a variant is a model label in a run; without --pair the variants of each base model are paired automatically:
-# the one whose calls report no reasoning tokens is "off", every other one is compared against it
+# variants whose calls report no reasoning tokens are "off", each is compared with every "on" variant
 # --pair takes labels such as zai-org/GLM-5.3-Flash@reasoning-none, or run:label where a label is in several runs
 # a label that is in several runs (a control slice rerun later) is also compared with itself: drift between the runs
 
@@ -68,10 +68,7 @@ def auto_pairs(variants):
     for base, vs in sorted(by_base.items()):
         off = [v for v in vs if not thinks(variants[v])]
         on = [v for v in vs if thinks(variants[v])]
-        if len(off) == 1:
-            pairs += [(off[0], v) for v in on]
-        elif on and off:
-            print(f"{base}: {len(off)} variants without reasoning, choose one with --pair\n")
+        pairs += [(a, b) for a in off for b in on]
     return pairs
 
 
