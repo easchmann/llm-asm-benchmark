@@ -3,7 +3,7 @@
 # usage: scripts/launch_full.sh <run-id> <repeats> [shard ...]    (no shard names = all shards)
 # running it again resumes: finished cells are skipped, sessions that still exist are left alone
 # DRY_RUN=1 prints the commands instead of starting sessions
-# MAX_REPAIRS (default 5) and RUN_ARGS (extra run_desc options, e.g. "--temperature 0.6 --seed 42") apply to all shards
+# MAX_REPAIRS (default 5) and RUN_ARGS (extra run_desc options, e.g. "--temperature 0.6 --seed 42" or "--plan") apply to all shards
 
 set -euo pipefail
 [ $# -ge 2 ] || { echo "usage: $0 <run-id> <repeats> [shard ...]"; exit 1; }

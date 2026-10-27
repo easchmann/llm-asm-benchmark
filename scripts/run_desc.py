@@ -50,10 +50,16 @@ def write_run_txt(run_dir, args):
         f"nonce: {not args.no_nonce}",
         f"feedback: {args.feedback}",
         f"start_from: {args.start_from}",
+        f"mode: {mode(args)}",
+        f"plan_from: {args.plan_from}",
         f"args: {json.dumps(vars(args))}",
     ]
     with open(os.path.join(run_dir, "RUN.txt"), "a") as f:
         f.write("\n".join(lines) + "\n\n")
+
+
+def mode(args):
+    return "plan" if args.plan else "ref_plan" if args.plan_from else "direct"
 
 
 def main():
@@ -75,16 +81,24 @@ def main():
     p.add_argument("--seed-per-repeat", action="store_true", help="use seed + repeat instead of the same seed")
     p.add_argument("--no-nonce", action="store_true", help="no call-id in prompts and no gateway cache: identical cells send identical requests")
     p.add_argument("--start-from", help="run dir: only cells that failed round 0 there, starting from that reply")
+    planning = p.add_mutually_exclusive_group()
+    planning.add_argument("--plan", action="store_true", help="ask for an implementation plan before the code")
+    planning.add_argument("--plan-from", help="dir with reference plans <kernel>/<level>.txt given to the model instead")
     args = p.parse_args()
+    if (args.plan or args.plan_from) and args.start_from:
+        p.error("--plan and --plan-from cannot be combined with --start-from")
     if not API_KEY:
         sys.exit("set RIVAULT_API_KEY first")
     if args.start_from:
         args.start_from = os.path.abspath(args.start_from)
+    if args.plan_from:
+        args.plan_from = os.path.abspath(args.plan_from)
 
     run_dir = os.path.join(ROOT, "results", args.run_id)
-    mixed = {(r.get("nonce", True), r.get("start_from")) for r in load_records(run_dir)} - {(not args.no_nonce, args.start_from)}
+    mixed = ({(r.get("nonce", True), r.get("start_from"), r.get("mode", "direct")) for r in load_records(run_dir)}
+             - {(not args.no_nonce, args.start_from, mode(args))})
     if mixed:
-        sys.exit(f"{args.run_id} already has cells with other settings (nonce, start_from) {mixed}; use a new --run-id")
+        sys.exit(f"{args.run_id} already has cells with other settings (nonce, start_from, mode) {mixed}; use a new --run-id")
     todo = None
     if args.start_from:
         todo = {cell for cell, rounds in trajectories(load_records(args.start_from)).items()
@@ -104,6 +118,8 @@ def main():
                         "--model", model, "--run-dir", run_dir, "--repeat", str(repeat),
                         "--max-repairs", str(args.max_repairs), "--feedback", args.feedback, "--log", log]
                        + (["--no-nonce"] if args.no_nonce else [])
+                       + (["--plan"] if args.plan else [])
+                       + (["--plan-from", args.plan_from] if args.plan_from else [])
                        + (["--start-from", args.start_from] if args.start_from else [])
                        + (["--reasoning-effort", args.reasoning_effort] if args.reasoning_effort else [])
                        + (["--temperature", str(args.temperature)] if args.temperature is not None else [])
