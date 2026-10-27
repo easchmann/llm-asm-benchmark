@@ -10,7 +10,7 @@ import re
 import sys
 import tempfile
 
-from gen_desc import DESC, V2, check, crash_site, extract_asm, extract_c, fail_lines, feedback_v2
+from gen_desc import DESC, V2, check, crash_site, extract_asm, extract_c, fail_lines, feedback_v2, plan_has_code
 
 ASM = ".globl axpy\naxpy:\n    ret\n"
 REPLIES = [
@@ -29,6 +29,12 @@ C_REPLIES = [
     ("two blocks", f"```c\n{C}```\nFixed:\n```c\n{C}```", "last_of_2_blocks"),
     ("prototype only", "```c\nvoid axpy(long n, double a, const double *x, double *y);\n```", "no_definition"),
     ("other function", "```c\nvoid ref_axpy(long n)\n{\n}\n```", "no_definition"),
+]
+PLANS = [
+    ("prose plan", "- n arrives in %rdi, a in %xmm0.\n- Loop i from 0 to n-1, address 8*i(%rsi).\nNo callee-saved registers.", False),
+    ("register table", "```\nrdi  n\nrsi  x\nxmm0 a\n```\nLoop over i.", False),
+    ("fenced code", "Plan:\n```asm\n    movsd (%rsi,%rcx,8), %xmm1\n```", True),
+    ("unfenced code", "    addq $1, %rcx\n" * 5, True),
 ]
 
 
@@ -133,6 +139,9 @@ def main():
     for label, reply, want in C_REPLIES:
         _, how = extract_c(reply, "axpy")
         ok &= report(how == want, f"extract C {label}", how)
+
+    for label, plan, want in PLANS:
+        ok &= report(plan_has_code(plan) == want, f"plan_has_code {label}", plan_has_code(plan))
 
     print("\nall good" if ok else "\nproblems found")
     sys.exit(0 if ok else 1)

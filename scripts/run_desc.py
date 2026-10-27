@@ -53,10 +53,16 @@ def write_run_txt(run_dir, args):
         f"start_from: {args.start_from}",
         f"target: {args.target}" + (f" (gcc {' '.join(C_FLAGS)})" if args.target == "c" else ""),
         f"base_model: {args.base_model or ', '.join(args.models)}",
+        f"mode: {mode(args)}",
+        f"plan_from: {args.plan_from}",
         f"args: {json.dumps(vars(args))}",
     ]
     with open(os.path.join(run_dir, "RUN.txt"), "a") as f:
         f.write("\n".join(lines) + "\n\n")
+
+
+def mode(args):
+    return "c" if args.target == "c" else "plan" if args.plan else "ref_plan" if args.plan_from else "direct"
 
 
 def main():
@@ -80,16 +86,24 @@ def main():
     p.add_argument("--seed-per-repeat", action="store_true", help="use seed + repeat instead of the same seed")
     p.add_argument("--no-nonce", action="store_true", help="no call-id in prompts and no gateway cache: identical cells send identical requests")
     p.add_argument("--start-from", help="run dir: only cells that failed round 0 there, starting from that reply")
+    planning = p.add_mutually_exclusive_group()
+    planning.add_argument("--plan", action="store_true", help="ask for an implementation plan before the code")
+    planning.add_argument("--plan-from", help="dir with reference plans <kernel>/<level>.txt given to the model instead")
     args = p.parse_args()
+    if (args.plan or args.plan_from) and args.start_from:
+        p.error("--plan and --plan-from cannot be combined with --start-from")
+    if args.target == "c" and (args.plan or args.plan_from):
+        p.error("--plan and --plan-from are for assembly, not --target c")
     if not API_KEY:
         sys.exit("set RIVAULT_API_KEY first")
     if args.start_from:
         args.start_from = os.path.abspath(args.start_from)
+    if args.plan_from:
+        args.plan_from = os.path.abspath(args.plan_from)
 
     run_dir = os.path.join(ROOT, "results", args.run_id)
-    mode = "c" if args.target == "c" else "direct"
     mixed = ({(r.get("nonce", True), r.get("start_from"), r.get("mode", "direct")) for r in load_records(run_dir)}
-             - {(not args.no_nonce, args.start_from, mode)})
+             - {(not args.no_nonce, args.start_from, mode(args))})
     if mixed:
         sys.exit(f"{args.run_id} already has cells with other settings (nonce, start_from, mode) {mixed}; use a new --run-id")
     todo = None
@@ -113,6 +127,8 @@ def main():
                        + (["--no-nonce"] if args.no_nonce else [])
                        + (["--target", args.target] if args.target != "asm" else [])
                        + (["--base-model", args.base_model] if args.base_model else [])
+                       + (["--plan"] if args.plan else [])
+                       + (["--plan-from", args.plan_from] if args.plan_from else [])
                        + (["--start-from", args.start_from] if args.start_from else [])
                        + (["--reasoning-effort", args.reasoning_effort] if args.reasoning_effort else [])
                        + (["--temperature", str(args.temperature)] if args.temperature is not None else [])

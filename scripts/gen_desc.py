@@ -4,6 +4,8 @@
 #        --reply-file reply.txt uses a saved reply instead of calling the API
 #        --start-from results/desc_full takes round 0 from that run's saved reply for the same cell
 #        --target c asks for C instead of assembly (baseline: same task, compiled with gcc C_FLAGS)
+#        --plan asks for an implementation plan first, then for code that follows it (plan kept for repairs)
+#        --plan-from plans/claude-opus-5-5 gives the model the plan <dir>/<kernel>/<level>.txt instead
 
 import argparse
 import hashlib
@@ -27,9 +29,12 @@ REPAIR = os.path.join(ROOT, "prompts", "desc_repair.txt")
 C_PROMPT = os.path.join(ROOT, "prompts", "desc_c.txt")
 C_REPAIR = os.path.join(ROOT, "prompts", "desc_c_repair.txt")
 C_FLAGS = ["-O2", "-march=x86-64-v3"]
+PLAN = os.path.join(ROOT, "prompts", "desc_plan_x86_64.txt")
+FROM_PLAN = os.path.join(ROOT, "prompts", "desc_from_plan_x86_64.txt")
 
 THINK_RE = re.compile(r"<\s*(?:\w+:)?think(?:ing)?\s*>.*?<\s*/\s*(?:\w+:)?think(?:ing)?\s*>", re.S | re.I)
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+ASM_LINE_RE = re.compile(r"^\s*(?:[\w.]+:\s*)?(?:\.globa?l\s|[a-z][a-z0-9]{1,10}\s+[$%(\-\d][^\n]*%[a-z])", re.M)
 SIZE_RE = re.compile(r"^size (\S+): (pass|fail)", re.M)
 ERR_RE = re.compile(r"Error:|error:|undefined reference")
 RET_RE = re.compile(r"^\s*(?:[\w.]+:\s*)?(?:rep\s+|repz\s+)?ret[qlw]?\b", re.M)
@@ -89,6 +94,19 @@ def load_kernel(kernel, level):
 def build_prompt(spec, description, template=PROMPT):
     return fill(template, {"NAME": spec["name"], "SIGNATURE": spec["signature"],
                            "LAYOUT": spec["layout"], "DESCRIPTION": description})
+
+
+def plan_has_code(plan):
+    return any(ASM_LINE_RE.search(b) for b in FENCE_RE.findall(plan)) or len(ASM_LINE_RE.findall(plan)) >= 5
+
+
+def add(a, b):
+    if isinstance(a, dict) or isinstance(b, dict):
+        a, b = a or {}, b or {}
+        return {k: add(a.get(k), b.get(k)) for k in {**a, **b}}
+    if a is None or b is None:
+        return b if a is None else a
+    return a + b
 
 
 def extract_code(reply, wanted, missing):
@@ -287,6 +305,51 @@ def save(path, text):
         f.write(text)
 
 
+def record(args, cell, label, rnd, prompt):
+    return {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "run": os.path.basename(os.path.normpath(args.run_dir)), "cell": cell,
+            "kernel": args.kernel, "level": args.level, "model": label,
+            "api_model": args.model, "reasoning_effort": args.reasoning_effort,
+            "base_model": args.base_model or args.model, "repeat": args.repeat, "round": rnd,
+            "mode": "c" if args.target == "c" else "plan" if args.plan else "ref_plan" if args.plan_from else "direct",
+            "feedback": args.feedback if rnd else None,
+            "feedback_mode": args.feedback, "nonce": not args.no_nonce, "start_from": args.start_from,
+            "prompt_sha": sha(prompt)}
+
+
+def add_plan(rec, planned):
+    rec.update(planned)
+    if "plan_usage" in planned and not planned["plan_reused"]:
+        for key in ("usage", "cost_usd", "elapsed_seconds"):
+            rec[key] = add(planned["plan_" + key], rec[key])
+
+
+def own_plan(args, plan_prompt, raw_dir, cell):
+    meta = os.path.join(raw_dir, cell + ".plan.json")
+    if os.path.exists(meta):
+        plan = THINK_RE.sub("", open(os.path.join(raw_dir, cell + ".plan.txt")).read()).strip()
+        return plan, dict(json.load(open(meta)), plan_reused=True)
+    r = ask(args, plan_prompt)
+    save(os.path.join(raw_dir, cell + ".plan.txt"), r["content"])
+    if r.get("reasoning"):
+        save(os.path.join(raw_dir, cell + ".plan.reasoning.txt"), r["reasoning"])
+    plan = THINK_RE.sub("", r["content"]).strip()
+    planned = {"plan_failed": False, "plan_reused": False, "plan_underlying_model": r["underlying_model"],
+               "plan_finish_reason": r["finish_reason"], "plan_usage": r["usage"],
+               "plan_cost_usd": r["cost_usd"], "plan_elapsed_seconds": r["elapsed_seconds"],
+               "plan_attempts": r.get("attempts"), "plan_prompt_sha": sha(plan_prompt),
+               "plan_sha": sha(plan), "plan_chars": len(plan), "plan_has_code": plan_has_code(plan)}
+    save(meta, json.dumps(planned))
+    return plan, planned
+
+
+def ref_plan(args):
+    path = os.path.join(args.plan_from, args.kernel, args.level + ".txt")
+    plan = open(path).read().strip()
+    return plan, {"plan_source": os.path.relpath(path, ROOT), "plan_sha": sha(plan), "plan_chars": len(plan),
+                  "plan_has_code": plan_has_code(plan)}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--kernel", required=True)
@@ -305,7 +368,14 @@ def main():
     p.add_argument("--reply-file")
     p.add_argument("--start-from", help="run dir whose saved round-0 reply for this cell replaces the first call")
     p.add_argument("--log", help="log file (default: <run-dir>/calls.jsonl)")
+    planning = p.add_mutually_exclusive_group()
+    planning.add_argument("--plan", action="store_true", help="first ask for an implementation plan, then for code following it")
+    planning.add_argument("--plan-from", help="dir with reference plans <kernel>/<level>.txt given to the model instead")
     args = p.parse_args()
+    if (args.plan or args.plan_from) and (args.reply_file or args.start_from):
+        p.error("--plan and --plan-from cannot be combined with --reply-file or --start-from")
+    if args.target == "c" and (args.plan or args.plan_from):
+        p.error("--plan and --plan-from are for assembly, not --target c")
     if not args.reply_file and not llm_client.API_KEY:
         sys.exit("set RIVAULT_API_KEY first")
 
@@ -327,23 +397,36 @@ def main():
 
     c = args.target == "c"
     base = build_prompt(spec, description, C_PROMPT if c else PROMPT)
+    planned = {}
+    if args.plan:
+        plan_prompt = build_prompt(spec, description, PLAN)
+        try:
+            plan, planned = own_plan(args, plan_prompt, raw_dir, cell)
+        except LlmError as e:
+            rec = record(args, cell, label, 0, plan_prompt)
+            rec.update(stage="no_answer", error=str(e), plan_failed=True, usage=e.usage, cost_usd=e.cost_usd,
+                       elapsed_seconds=e.elapsed_seconds, attempts=e.attempts, plan_usage=e.usage,
+                       plan_cost_usd=e.cost_usd, plan_elapsed_seconds=e.elapsed_seconds, stop_reason="api_error")
+            append_call(log, rec)
+            print(f"{cell}.plan: no_answer ({e})")
+            return
+        base += "\n\n" + fill(FROM_PLAN, {"PLAN": plan})
+    elif args.plan_from:
+        plan, planned = ref_plan(args)
+        base += "\n\n" + fill(FROM_PLAN, {"PLAN": plan})
+
     prompt, prev_sig = base, None
     for rnd in range(args.max_repairs + 1):
         tag = f"{cell}.r{rnd}"
-        rec = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-               "run": os.path.basename(os.path.normpath(args.run_dir)), "cell": cell,
-               "kernel": args.kernel, "level": args.level, "model": label,
-               "api_model": args.model, "reasoning_effort": args.reasoning_effort,
-               "base_model": args.base_model or args.model, "repeat": args.repeat, "round": rnd,
-               "mode": "c" if c else "direct", "feedback": args.feedback if rnd else None,
-               "feedback_mode": args.feedback, "nonce": not args.no_nonce, "start_from": args.start_from,
-               "prompt_sha": sha(prompt)}
+        rec = record(args, cell, label, rnd, prompt)
         try:
             r = ask(args, prompt, first_reply if rnd == 0 else args.reply_file)
         except LlmError as e:
             rec.update(stage="no_answer", error=str(e), usage=e.usage, cost_usd=e.cost_usd,
                        elapsed_seconds=e.elapsed_seconds, attempts=e.attempts,
                        stop_reason="api_error")
+            if rnd == 0 and planned:
+                add_plan(rec, planned)
             append_call(log, rec)
             print(f"{tag}: no_answer ({e})")
             return
@@ -352,6 +435,8 @@ def main():
                    sampling_params=r["sampling_params"], usage=r["usage"],
                    cost_usd=r["cost_usd"], elapsed_seconds=r["elapsed_seconds"],
                    attempts=r.get("attempts"), cache_headers=r.get("cache_headers"))
+        if rnd == 0 and planned:
+            add_plan(rec, planned)
         save(os.path.join(raw_dir, tag + ".txt"), r["content"])
         if r.get("reasoning"):
             save(os.path.join(raw_dir, tag + ".reasoning.txt"), r["reasoning"])
