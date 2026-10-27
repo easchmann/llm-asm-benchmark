@@ -3,6 +3,7 @@
 # reasoning tokens, completion tokens, whether reasoning came back, time and the cost from the gateway headers
 # usage: python3 scripts/probe_reasoning.py [--models Qwen/Qwen3.8-27B ...] [--settings default low] [--repeats 2]
 #        --task gemm L3 sends that cell's real prompt instead of the arithmetic question (does a setting fit the 600 s limit?)
+#        --glm-off tries GLM's own switches for turning reasoning off (template kwargs, thinking field, /nothink)
 # every request is also appended to results/probe_reasoning.jsonl
 
 import argparse
@@ -23,6 +24,17 @@ PROBES = [
     ("Qwen/Qwen3.8-27B", ["none", "low", "default"]),
     ("moonshotai/Kimi-K3", ["none"]),
 ]
+NO_THINK = {"enable_thinking": False}
+GLM_OFF = [
+    ("default", None, {}, ""),
+    ("chat_template_kwargs", None, {"chat_template_kwargs": NO_THINK}, ""),
+    ("chat_template_kwargs, allowed", None,
+     {"chat_template_kwargs": NO_THINK, "allowed_openai_params": ["chat_template_kwargs"]}, ""),
+    ("extra_body", None, {"extra_body": {"chat_template_kwargs": NO_THINK}}, ""),
+    ("thinking disabled", None, {"thinking": {"type": "disabled"}}, ""),
+    ("/nothink", None, {}, " /nothink"),
+    ("effort minimal", "minimal", {}, ""),
+]
 MAX_TRIES = {"moonshotai/Kimi-K3": 1}
 
 
@@ -30,10 +42,15 @@ def reasoning_tokens(usage):
     return (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
 
 
+def effort_setting(setting):
+    return (setting, None if setting == "default" else setting, {}, "")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--models", nargs="+", help="default: all models in PROBES")
     p.add_argument("--settings", nargs="+", help="reasoning_effort values to send, 'default' sends none (default: per model)")
+    p.add_argument("--glm-off", action="store_true", help="GLM only, with the settings in GLM_OFF")
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--task", nargs=2, metavar=("KERNEL", "LEVEL"))
     p.add_argument("--log", default=os.path.join(ROOT, "results", "probe_reasoning.jsonl"))
@@ -46,20 +63,22 @@ def main():
     if args.task:
         _, spec, description = load_kernel(*args.task)
         prompt = build_prompt(spec, description)
-    probes = [(m, args.settings or s) for m, s in PROBES if not args.models or m in args.models]
-    probes += [(m, args.settings or ["default"]) for m in args.models or [] if m not in dict(PROBES)]
+    if args.glm_off:
+        probes = [("zai-org/GLM-5.3-Flash", [s for s in GLM_OFF if not args.settings or s[0] in args.settings])]
+    else:
+        probes = [(m, list(map(effort_setting, args.settings or s))) for m, s in PROBES if not args.models or m in args.models]
+        probes += [(m, list(map(effort_setting, args.settings or ["default"]))) for m in args.models or [] if m not in dict(PROBES)]
 
     rows, summary, total = [], [], 0.0
     for model, settings in probes:
-        for setting in settings:
-            effort = None if setting == "default" else setting
+        for setting, effort, extra, suffix in settings:
             seen = []
             for i in range(min(args.repeats, MAX_TRIES.get(model, args.repeats))):
-                rec = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": model, "reasoning_effort": effort,
-                       "task": args.task, "try": i}
+                rec = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": model, "setting": setting,
+                       "reasoning_effort": effort, "extra_body": extra, "suffix": suffix, "task": args.task, "try": i}
                 try:
-                    r = llm_client.call_llm(model, prompt + f"\n/* call-id: {llm_client.new_call_id()} */\n",
-                                            reasoning_effort=effort)
+                    r = llm_client.call_llm(model, prompt + f"\n/* call-id: {llm_client.new_call_id()} */\n" + suffix,
+                                            reasoning_effort=effort, extra_body=extra)
                     usage = r["usage"]
                     rec.update(status="ok", finish_reason=r["finish_reason"], usage=usage, cost_usd=r["cost_usd"],
                                elapsed_seconds=r["elapsed_seconds"], underlying_model=r["underlying_model"],
@@ -81,15 +100,15 @@ def main():
             mean = lambda f: f"{sum(f(r) or 0 for r in ok) / len(ok):.0f}" if ok else "-"
             summary.append([model, setting, f"{len(ok)}/{len(seen)}", mean(lambda r: reasoning_tokens(r["usage"])),
                             mean(lambda r: r["usage"].get("completion_tokens")), mean(lambda r: r["reasoning_chars"]),
-                            max((r["elapsed_seconds"] or 0 for r in seen), default=0),
+                            sum(r["think_in_content"] for r in ok), max((r["elapsed_seconds"] or 0 for r in seen), default=0),
                             f"${sum(r['cost_usd'] or 0 for r in seen) / len(seen):.4f}"])
 
     heading("Requests" + (f" (prompt: {args.task[0]} {args.task[1]})" if args.task else f" (prompt: {QUESTION})"))
-    table(["model", "reasoning_effort", "try", "status", "finish", "reasoning tokens", "completion tokens",
+    table(["model", "setting", "try", "status", "finish", "reasoning tokens", "completion tokens",
            "reasoning_content chars", "<think> in content", "answer (end)", "s", "cost", "underlying model"], rows)
     heading("Per model and setting")
-    table(["model", "reasoning_effort", "answered", "reasoning tokens", "completion tokens", "reasoning_content chars",
-           "slowest s", "cost per request"], summary)
+    table(["model", "setting", "answered", "reasoning tokens", "completion tokens", "reasoning_content chars",
+           "answers with <think>", "slowest s", "cost per request"], summary)
     print(f"Total cost: ${total:.4f} (log: {args.log})")
 
 

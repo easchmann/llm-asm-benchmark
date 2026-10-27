@@ -121,7 +121,7 @@ def resolve_model(alias, *, timeout=REQUEST_TIMEOUT, base_url=None, api_key=None
 
 def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
              base_url=None, api_key=None, temperature=None, top_p=None, seed=None,
-             reasoning_effort=None, no_cache=False):
+             reasoning_effort=None, no_cache=False, extra_body=None):
     """One chat/completions round trip, retrying transient gateway failures
     (504/502/503/429/timeouts) with exponential backoff.
 
@@ -132,6 +132,7 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
     llm_calls.jsonl record self-describes its own sampling.
     no_cache=True asks the LiteLLM gateway neither to serve nor to store a cached answer;
     cache-related response headers are returned under cache_headers.
+    extra_body: further request fields sent as given (e.g. chat_template_kwargs), echoed in sampling_params.
 
     Returns dict(content, underlying_model, usage, cost_usd, key_spend_total_usd,
                  finish_reason, elapsed_seconds, reasoning, sampling_params).
@@ -155,6 +156,7 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         body_dict["reasoning_effort"] = reasoning_effort
     if no_cache:
         body_dict["cache"] = {"no-cache": True, "no-store": True}
+    body_dict.update(extra_body or {})
     body = json.dumps(body_dict).encode()
     req = urllib.request.Request(
         f"{base_url}/chat/completions", data=body,
@@ -265,7 +267,7 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
         "attempts": attempts,
         "reasoning": message.get("reasoning_content"),
         "cache_headers": cache_headers,
-        "sampling_params": {k: body_dict[k] for k in ("temperature", "top_p", "seed", "reasoning_effort")
+        "sampling_params": {k: body_dict[k] for k in ("temperature", "top_p", "seed", "reasoning_effort", *(extra_body or {}))
                             if k in body_dict},
     }
 
