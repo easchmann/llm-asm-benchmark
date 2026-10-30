@@ -1,0 +1,19 @@
+#define AT(X, i, j, k) X[((i) * n + (j)) * n + (k)]
+
+void ref_heat3d(long tsteps, long n, double *A, double *B)
+{
+    for (long t = 0; t < tsteps; t++) {
+        for (long i = 1; i < n - 1; i++)
+            for (long j = 1; j < n - 1; j++)
+                for (long k = 1; k < n - 1; k++)
+                    AT(B, i, j, k) = 0.125 * (AT(A, i + 1, j, k) - 2.0 * AT(A, i, j, k) + AT(A, i - 1, j, k))
+                                   + 0.125 * (AT(A, i, j + 1, k) - 2.0 * AT(A, i, j, k) + AT(A, i, j - 1, k))
+                                   + 0.125 * (AT(A, i, j, k + 1) - 2.0 * AT(A, i, j, k) + AT(A, i, j, k - 1));
+        for (long i = 1; i < n - 1; i++)
+            for (long j = 1; j < n - 1; j++)
+                for (long k = 1; k < n - 1; k++)
+                    AT(A, i, j, k) = 0.125 * (AT(B, i + 1, j, k) - 2.0 * AT(B, i, j, k) + AT(B, i - 1, j, k))
+                                   + 0.125 * (AT(B, i, j + 1, k) - 2.0 * AT(B, i, j, k) + AT(B, i, j - 1, k))
+                                   + 0.125 * (AT(B, i, j, k + 1) - 2.0 * AT(B, i, j, k) + AT(B, i, j, k - 1));
+    }
+}
