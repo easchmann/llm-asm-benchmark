@@ -6,7 +6,9 @@
 import argparse
 import collections
 import csv
+import math
 import os
+import re
 
 from desc_repair import CATEGORY, trajectories
 from gen_desc import load_records
@@ -18,6 +20,8 @@ MODELS = [
     ("deepseek-ai/DeepSeek-V4-Flash", "DeepSeek-V4-Flash", "modelC"),
     ("Qwen/Qwen3.8-27B@reasoning-none", "Qwen3.8-27B (no thinking)", "modelD"),
 ]
+COLORS = ["modelA", "modelB", "modelC", "modelD", "modelE", "modelF", "modelG", "modelH", "modelI"]
+FAMILIES = ["opus", "sonnet", "haiku"]
 CATEGORIES = [("blas1", "BLAS-1"), ("blas2", "BLAS-2"), ("blas3", "BLAS-3"),
               ("stencil", "stencil"), ("integer", "integer"), ("irregular", "irregular")]
 ROUND_BINS = [("round 0 (first try)", "rnd0"), ("round 1", "rnd1"), ("round 2", "rnd2"),
@@ -35,6 +39,11 @@ PREAMBLE = r"""\usepackage{pgfplots}
 \definecolor{modelB}{HTML}{EB6834}
 \definecolor{modelC}{HTML}{1BAF7A}
 \definecolor{modelD}{HTML}{EDA100}
+\definecolor{modelE}{HTML}{E87BA4}
+\definecolor{modelF}{HTML}{008300}
+\definecolor{modelG}{HTML}{7B5CD6}
+\definecolor{modelH}{HTML}{8C6D46}
+\definecolor{modelI}{HTML}{52514E}
 \definecolor{failA}{HTML}{2A78D6}
 \definecolor{failB}{HTML}{EB6834}
 \definecolor{failC}{HTML}{1BAF7A}
@@ -98,6 +107,24 @@ def tex_name(text):
     return text.replace("_", r"\_")
 
 
+def model_name(model):
+    name, _, variant = model.split("/")[-1].partition("@")
+    if name.startswith("claude-"):
+        family, *version = re.sub(r"-\d{8}$", "", name).split("-")[1:]
+        name = f"{family.capitalize()} {'.'.join(version)}"
+    return name + (" (no thinking)" if variant in ("thinking-off", "reasoning-none") else "")
+
+
+def run_models(cells):
+    present = {c[0]["model"] for c in cells}
+    known = [m for m in MODELS if m[0] in present]
+    if len(known) == len(present):
+        return known
+    family = lambda m: next((-i for i, f in enumerate(FAMILIES) if f in m), -len(FAMILIES))
+    order = sorted(present, key=lambda m: (family(m), *m.partition("@")[::2]), reverse=True)
+    return [(m, model_name(m), COLORS[i % len(COLORS)]) for i, m in enumerate(order)]
+
+
 def coords(points):
     return " ".join(f"({x:g},{y:.2f})" for x, y in points)
 
@@ -125,7 +152,7 @@ def write(out, name, body):
 
 
 def fig_levels(rate, out):
-    width = 0.18
+    width = 0.72 / len(MODELS)
     body = ("\\begin{tikzpicture}\n\\begin{axis}[descaxis, ybar, width=\\linewidth, height=0.5\\linewidth,\n"
             "  ymax=112, enlarge x limits={abs=0.6}, ylabel={pass rate (\\%)}, xlabel={description level},\n"
             "  legend columns=3, legend style={at={(0.5,1.03)}, anchor=south}]\n")
@@ -139,7 +166,7 @@ def fig_levels(rate, out):
 
 
 def fig_kernels(rate, kernels, out):
-    width = 0.18
+    width = 0.72 / len(MODELS)
     body = ("\\begin{tikzpicture}\n\\begin{groupplot}[descaxis, ybar, group style={group size=4 by 6,\n"
             "  horizontal sep=0.6cm, vertical sep=1.1cm, y descriptions at=edge left},\n"
             "  width=0.31\\linewidth, height=0.24\\linewidth, ytick={0,50,100},\n"
@@ -160,8 +187,10 @@ def fig_kernels(rate, kernels, out):
 
 
 def stacked_panels(out, name, shares, bins, ylabel, legend_columns, rows=1, row_titles=None):
+    cols = min(4, len(MODELS))
+    per_row = math.ceil(len(MODELS) / cols)
     body = ("\\begin{tikzpicture}\n\\begin{groupplot}[descaxis, ybar stacked, /pgf/bar width=0.55,\n"
-            f"  group style={{group size=4 by {rows}, horizontal sep=0.5cm, vertical sep=2.2cm, y descriptions at=edge left}},\n"
+            f"  group style={{group size={cols} by {rows * per_row}, horizontal sep=0.5cm, vertical sep=2.2cm, y descriptions at=edge left}},\n"
             f"  width=0.3\\linewidth, height=0.32\\linewidth, ylabel={{{ylabel}}}]\n")
     for row in range(rows):
         for m, (model, label, _) in enumerate(MODELS):
@@ -173,7 +202,9 @@ def stacked_panels(out, name, shares, bins, ylabel, legend_columns, rows=1, row_
                 body += f"  \\addplot[fill={color}, draw=white, line width=0.6pt] coordinates {{{coords(points)}}};\n"
                 if row == 0 and m == 0:
                     body += f"  \\addlegendentry{{{b_label}}}\n"
-    body += (f"\\end{{groupplot}}\n\\node[anchor=north] at ($(group c2r{rows}.south)!0.5!(group c3r{rows}.south) + (0,-0.9cm)$)"
+        body += "\\nextgroupplot[group/empty plot]\n" * (cols * per_row - len(MODELS))
+    left, right = (2, 3) if cols == 4 else (1, cols)
+    body += (f"\\end{{groupplot}}\n\\node[anchor=north] at ($(group c{left}r{rows * per_row}.south)!0.5!(group c{right}r{rows * per_row}.south) + (0,-0.9cm)$)"
              f" {{\\pgfplotslegendfromname{{{name}legend}}}};\n\\end{{tikzpicture}}\n")
     write(out, name, body)
 
@@ -186,7 +217,9 @@ def main():
     out_dir = args.out or os.path.join(args.run_dir, "plots")
     os.makedirs(out_dir, exist_ok=True)
 
+    global MODELS
     cells = [c for c in trajectories(load_records(args.run_dir)).values() if c[0]["stage"] != "no_answer"]
+    MODELS = run_models(cells)
     groups = collections.defaultdict(list)
     for c in cells:
         r = c[0]
