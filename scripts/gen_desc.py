@@ -6,6 +6,7 @@
 #        --target c asks for C instead of assembly (baseline: same task, compiled with gcc C_FLAGS)
 #        --plan asks for an implementation plan first, then for code that follows it (plan kept for repairs)
 #        --plan-from plans/claude-opus-5-5 gives the model the plan <dir>/<kernel>/<level>.txt instead
+#        --thinking on|off with LLM_BACKEND=claude-cli asks a Claude model through the claude CLI (scripts/claude_cli.py)
 
 import argparse
 import hashlib
@@ -53,8 +54,8 @@ STAGE_WORDS = {"extract_fail": "no function found", "incomplete": "no ret instru
                "timeout": "did not finish in time", "wrong": "wrong results"}
 
 
-def model_label(model, reasoning_effort=None):
-    return f"{model}@reasoning-{reasoning_effort}" if reasoning_effort else model
+def model_label(model, reasoning_effort=None, thinking=None):
+    return model + (f"@reasoning-{reasoning_effort}" if reasoning_effort else "") + (f"@thinking-{thinking}" if thinking else "")
 
 
 def cell_id(kernel, level, model, repeat):
@@ -297,7 +298,7 @@ def ask(args, prompt, reply_file=None):
     if not args.no_nonce:
         prompt += f"\n/* call-id: {llm_client.new_call_id()} */\n"
     return llm_client.call_llm(args.model, prompt, temperature=args.temperature, seed=args.seed,
-                               reasoning_effort=args.reasoning_effort, no_cache=args.no_nonce)
+                               reasoning_effort=args.reasoning_effort, no_cache=args.no_nonce, thinking=args.thinking)
 
 
 def save(path, text):
@@ -309,7 +310,7 @@ def record(args, cell, label, rnd, prompt):
     return {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "run": os.path.basename(os.path.normpath(args.run_dir)), "cell": cell,
             "kernel": args.kernel, "level": args.level, "model": label,
-            "api_model": args.model, "reasoning_effort": args.reasoning_effort,
+            "api_model": args.model, "reasoning_effort": args.reasoning_effort, "thinking": args.thinking,
             "base_model": args.base_model or args.model, "repeat": args.repeat, "round": rnd,
             "mode": "c" if args.target == "c" else "plan" if args.plan else "ref_plan" if args.plan_from else "direct",
             "feedback": args.feedback if rnd else None,
@@ -362,6 +363,7 @@ def main():
     p.add_argument("--temperature", type=float)
     p.add_argument("--seed", type=int)
     p.add_argument("--reasoning-effort", help="e.g. none: passed to the gateway, cells get a separate label")
+    p.add_argument("--thinking", choices=["on", "off"], help="needs LLM_BACKEND=claude-cli, cells get a separate label")
     p.add_argument("--target", choices=["asm", "c"], default="asm", help="c: the model writes C, compiled with gcc C_FLAGS")
     p.add_argument("--base-model", help="the model behind an alias such as RiVault/Reasoning-Medium, logged as base_model")
     p.add_argument("--no-nonce", action="store_true", help="no call-id in the prompt and no gateway cache")
@@ -376,11 +378,13 @@ def main():
         p.error("--plan and --plan-from cannot be combined with --reply-file or --start-from")
     if args.target == "c" and (args.plan or args.plan_from):
         p.error("--plan and --plan-from are for assembly, not --target c")
-    if not args.reply_file and not llm_client.API_KEY:
+    if args.thinking and llm_client.BACKEND != "claude-cli":
+        p.error("--thinking needs LLM_BACKEND=claude-cli")
+    if not args.reply_file and not llm_client.ready():
         sys.exit("set RIVAULT_API_KEY first")
 
     kdir, spec, description = load_kernel(args.kernel, args.level)
-    label = model_label(args.model, args.reasoning_effort)
+    label = model_label(args.model, args.reasoning_effort, args.thinking)
     cell = cell_id(args.kernel, args.level, label, args.repeat)
     first_reply = args.reply_file
     if args.start_from:
@@ -434,7 +438,7 @@ def main():
         rec.update(underlying_model=r["underlying_model"], finish_reason=r["finish_reason"],
                    sampling_params=r["sampling_params"], usage=r["usage"],
                    cost_usd=r["cost_usd"], elapsed_seconds=r["elapsed_seconds"],
-                   attempts=r.get("attempts"), cache_headers=r.get("cache_headers"))
+                   attempts=r.get("attempts"), cache_headers=r.get("cache_headers"), **r.get("record", {}))
         if rnd == 0 and planned:
             add_plan(rec, planned)
         save(os.path.join(raw_dir, tag + ".txt"), r["content"])

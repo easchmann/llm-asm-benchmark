@@ -4,6 +4,7 @@
 #            --kernels axpy atax --levels L0 L2 L3 --repeats 2 [--shard name]
 # with --shard, this process logs to <run>/calls/<name>.jsonl, so several processes can share one run
 # --target c: the model writes C instead of assembly (baseline)
+# --thinking on|off with LLM_BACKEND=claude-cli: Claude models through the claude CLI, see scripts/claude_cli.py
 
 import argparse
 import itertools
@@ -15,7 +16,7 @@ import time
 
 from desc_repair import trajectories
 from gen_desc import C_FLAGS, cell_id, load_records, model_label
-from llm_client import API_KEY
+import llm_client
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GEN = os.path.join(ROOT, "scripts", "gen_desc.py")
@@ -57,6 +58,15 @@ def write_run_txt(run_dir, args):
         f"plan_from: {args.plan_from}",
         f"args: {json.dumps(vars(args))}",
     ]
+    if llm_client.BACKEND == "claude-cli":
+        import claude_cli
+        lines += [f"backend: claude-cli {claude_cli.version()} ({claude_cli.CLAUDE}), billing: subscription",
+                  f"claude_cli flags: {json.dumps(claude_cli.FLAGS)}, cwd {claude_cli.CWD}, timeout {claude_cli.TIMEOUT}s",
+                  f"claude_cli env: {json.dumps(claude_cli.ENV)}, all other CLAUDE*/ANTHROPIC* variables unset except {' '.join(claude_cli.KEEP_ENV)}",
+                  "claude_cli thinking: " + ", ".join(f"{m}: {json.dumps(claude_cli.settings(m, args.thinking, args.reasoning_effort)[1])}"
+                                                      for m in args.models),
+                  f"claude_cli system prompt: {claude_cli.SYSTEM_PROMPT!r}; added by the CLI and not removable: {claude_cli.ADDED_BY_CLI}",
+                  "claude_cli: temperature, top_p and seed are fixed by the CLI and cannot be set"]
     with open(os.path.join(run_dir, "RUN.txt"), "a") as f:
         f.write("\n".join(lines) + "\n\n")
 
@@ -75,6 +85,7 @@ def main():
     p.add_argument("--max-repairs", type=int, default=0)
     p.add_argument("--feedback", default="none")
     p.add_argument("--reasoning-effort", help="e.g. none: passed to the gateway, cells get a separate label")
+    p.add_argument("--thinking", choices=["on", "off"], help="needs LLM_BACKEND=claude-cli, cells get a separate label")
     p.add_argument("--target", choices=["asm", "c"], default="asm", help="c: the model writes C, compiled with gcc C_FLAGS")
     p.add_argument("--base-model", help="the model behind an alias such as RiVault/Reasoning-Medium, logged as base_model")
     p.add_argument("--max-errors", type=int, default=5, help="API errors in a row before pausing")
@@ -86,6 +97,7 @@ def main():
     p.add_argument("--seed-per-repeat", action="store_true", help="use seed + repeat instead of the same seed")
     p.add_argument("--no-nonce", action="store_true", help="no call-id in prompts and no gateway cache: identical cells send identical requests")
     p.add_argument("--start-from", help="run dir: only cells that failed round 0 there, starting from that reply")
+    p.add_argument("--remaining", action="store_true", help="print the number of cells still to do and exit")
     planning = p.add_mutually_exclusive_group()
     planning.add_argument("--plan", action="store_true", help="ask for an implementation plan before the code")
     planning.add_argument("--plan-from", help="dir with reference plans <kernel>/<level>.txt given to the model instead")
@@ -94,7 +106,9 @@ def main():
         p.error("--plan and --plan-from cannot be combined with --start-from")
     if args.target == "c" and (args.plan or args.plan_from):
         p.error("--plan and --plan-from are for assembly, not --target c")
-    if not API_KEY:
+    if args.thinking and llm_client.BACKEND != "claude-cli":
+        p.error("--thinking needs LLM_BACKEND=claude-cli")
+    if not llm_client.ready():
         sys.exit("set RIVAULT_API_KEY first")
     if args.start_from:
         args.start_from = os.path.abspath(args.start_from)
@@ -110,17 +124,19 @@ def main():
     if args.start_from:
         todo = {cell for cell, rounds in trajectories(load_records(args.start_from)).items()
                 if rounds[0]["stage"] not in ("pass", "no_answer")}
+    done = finished(run_dir)
+    cells = [(repeat, kernel, level, model, cell_id(kernel, level, model_label(model, args.reasoning_effort, args.thinking), repeat))
+             for repeat, kernel, level, model in itertools.product(range(args.repeats), args.kernels, args.levels, args.models)]
+    cells = [c for c in cells if c[4] not in done and (todo is None or c[4] in todo)]
+    if args.remaining:
+        print(len(cells))
+        return
     log = os.path.join(run_dir, "calls", f"{args.shard}.jsonl") if args.shard else os.path.join(run_dir, "calls.jsonl")
     os.makedirs(os.path.dirname(log), exist_ok=True)
     write_run_txt(run_dir, args)
-    done = finished(run_dir)
 
     errors = pauses = 0
-    cells = itertools.product(range(args.repeats), args.kernels, args.levels, args.models)
-    for repeat, kernel, level, model in cells:
-        cell = cell_id(kernel, level, model_label(model, args.reasoning_effort), repeat)
-        if cell in done or (todo is not None and cell not in todo):
-            continue
+    for repeat, kernel, level, model, cell in cells:
         subprocess.run([sys.executable, GEN, "--kernel", kernel, "--level", level,
                         "--model", model, "--run-dir", run_dir, "--repeat", str(repeat),
                         "--max-repairs", str(args.max_repairs), "--feedback", args.feedback, "--log", log]
@@ -131,6 +147,7 @@ def main():
                        + (["--plan-from", args.plan_from] if args.plan_from else [])
                        + (["--start-from", args.start_from] if args.start_from else [])
                        + (["--reasoning-effort", args.reasoning_effort] if args.reasoning_effort else [])
+                       + (["--thinking", args.thinking] if args.thinking else [])
                        + (["--temperature", str(args.temperature)] if args.temperature is not None else [])
                        + (["--seed", str(args.seed + (repeat if args.seed_per_repeat else 0))] if args.seed is not None else []))
 

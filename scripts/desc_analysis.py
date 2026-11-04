@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # analysis of a description->asm run: pass rates with kernel-bootstrap CIs, level effect, failure reasons,
 # kernel difficulty, PolyBench vs other, assembler errors, checks on passing code
-# usage: python3 scripts/desc_analysis.py results/desc_full
+# usage: python3 scripts/desc_analysis.py results/desc_full [results/desc_claude ...] (several runs: their models side by side)
 
 import collections
 import os
@@ -65,8 +65,8 @@ def reason(r):
 
 
 def main():
-    run_dir = sys.argv[1]
-    cells = [c for c in trajectories(load_records(run_dir)).values() if c[0]["stage"] != "no_answer"]
+    run_dirs = {os.path.basename(os.path.normpath(d)): d for d in sys.argv[1:]}
+    cells = [c for d in run_dirs.values() for c in trajectories(load_records(d)).values() if c[0]["stage"] != "no_answer"]
     models = sorted({c[0]["model"] for c in cells})
     of = lambda m, **kw: [c for c in cells if c[0]["model"] == m and all(c[0][k] == v for k, v in kw.items())]
 
@@ -133,7 +133,7 @@ def main():
         n = calls = suspicious = 0
         for c in of(m):
             last = c[-1]
-            path = os.path.join(run_dir, "code", f"{last['cell']}.r{last['round']}.S")
+            path = os.path.join(run_dirs[last["run"]], "code", f"{last['cell']}.r{last['round']}.S")
             if last["stage"] != "pass" or not os.path.exists(path):
                 continue
             asm = open(path, errors="replace").read()

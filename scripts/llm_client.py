@@ -13,6 +13,7 @@ import urllib.request
 
 BASE_URL = os.environ.get("RIVAULT_BASE_URL", "https://api.class2.llm.ai.r-ccs.riken.jp/v1")
 API_KEY = os.environ.get("RIVAULT_API_KEY")
+BACKEND = os.environ.get("LLM_BACKEND", "http")   # claude-cli: scripts/claude_cli.py, through the Claude subscription
 REQUEST_TIMEOUT = 900
 
 # Retry policy for transient gateway failures (504/502/503/429, timeout, conn reset).
@@ -119,9 +120,13 @@ def resolve_model(alias, *, timeout=REQUEST_TIMEOUT, base_url=None, api_key=None
     return (r or {}).get("underlying_model")
 
 
+def ready():
+    return BACKEND == "claude-cli" or bool(API_KEY)
+
+
 def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
              base_url=None, api_key=None, temperature=None, top_p=None, seed=None,
-             reasoning_effort=None, no_cache=False, extra_body=None):
+             reasoning_effort=None, no_cache=False, extra_body=None, thinking=None):
     """One chat/completions round trip, retrying transient gateway failures
     (504/502/503/429/timeouts) with exponential backoff.
 
@@ -138,7 +143,15 @@ def call_llm(alias, prompt, *, max_tokens=None, timeout=REQUEST_TIMEOUT,
                  finish_reason, elapsed_seconds, reasoning, sampling_params).
     Raises LlmError on failure (HTTP errors carry usage/cost read from the gateway).
     content=None is reported as LlmError ("empty content ...") and is NOT retried here;
-    callers decide whether raising the token cap makes sense (see generate_with_repair)."""
+    callers decide whether raising the token cap makes sense (see generate_with_repair).
+    LLM_BACKEND=claude-cli sends the prompt through the claude CLI instead (thinking on/off, no temperature/seed)."""
+    if BACKEND == "claude-cli":
+        if temperature is not None or top_p is not None or seed is not None or max_tokens is not None:
+            raise LlmError("the claude CLI cannot set temperature, top_p, seed or max_tokens")
+        import claude_cli
+        return claude_cli.call(alias, prompt, thinking=thinking, effort=reasoning_effort)
+    if thinking:
+        raise LlmError("thinking on/off needs LLM_BACKEND=claude-cli")
     base_url = (base_url or BASE_URL).rstrip("/")
     api_key = api_key if api_key is not None else API_KEY
     if not api_key:

@@ -3,6 +3,7 @@
 # usage: scripts/launch_full.sh <run-id> <repeats> [shard ...]    (no shard names = all shards)
 # running it again resumes: finished cells are skipped, sessions that still exist are left alone
 # DRY_RUN=1 prints the commands instead of starting sessions
+# ONLY="axpy atax ..." restricts every shard to these kernels (shards left with none are skipped)
 # MAX_REPAIRS (default 5) and RUN_ARGS (extra run_desc options, e.g. "--temperature 0.6 --seed 42" or "--plan") apply to all shards
 
 set -euo pipefail
@@ -34,9 +35,14 @@ ALL="kimi-1 kimi-2 glm-1 glm-2 glm-3 deepseek qwen"
 [ "${DRY_RUN:-0}" = 1 ] || mkdir -p "$ROOT/results/$RUN_ID/logs"
 for shard in ${@:-$ALL}; do
     [ -n "${MODEL[$shard]:-}" ] || { echo "unknown shard: $shard (known: $ALL)"; exit 1; }
+    kernels=${KERNELS[$shard]}
+    if [ -n "${ONLY:-}" ]; then
+        kernels=$(for k in $kernels; do [[ " $ONLY " == *" $k "* ]] && echo -n "$k "; done; true)
+        [ -n "$kernels" ] || continue
+    fi
     session="$RUN_ID-$shard"
     cmd="python3 scripts/run_desc.py --run-id $RUN_ID --repeats $REPEATS --levels L0 L1 L2 L3 \
---kernels ${KERNELS[$shard]} --models ${MODEL[$shard]} ${EXTRA[$shard]:-} \
+--kernels $kernels --models ${MODEL[$shard]} ${EXTRA[$shard]:-} \
 --max-repairs ${MAX_REPAIRS:-5} --feedback compile+tests ${RUN_ARGS:-} --shard $shard 2>&1 | tee -a results/$RUN_ID/logs/$shard.out"
     if [ "${DRY_RUN:-0}" = 1 ]; then
         echo "[$session] $cmd"
