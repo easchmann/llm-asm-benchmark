@@ -21,31 +21,31 @@
 | model |  | L3 - L0 | kernels better | same | worse |
 |---|---|---|---|---|---|
 | Qwen3.8-27B@reasoning-none | first try | -7 pts [-12, -2] | 2 | 13 | 9 |
-| Qwen3.8-27B@reasoning-none | after repair | -12 pts [-22, +0] | 5 | 5 | 14 |
-| claude-haiku-4-5-20251001@thinking-off | first try | +2 pts [-6, +11] | 9 | 11 | 4 |
-| claude-haiku-4-5-20251001@thinking-off | after repair | -5 pts [-18, +9] | 6 | 9 | 9 |
-| claude-haiku-4-5-20251001@thinking-on | first try | -9 pts [-20, +2] | 7 | 6 | 11 |
+| Qwen3.8-27B@reasoning-none | after repair | -12 pts [-23, +0] | 5 | 5 | 14 |
+| claude-haiku-4-5-20251001@thinking-off | first try | +2 pts [-6, +10] | 9 | 11 | 4 |
+| claude-haiku-4-5-20251001@thinking-off | after repair | -5 pts [-18, +8] | 6 | 9 | 9 |
+| claude-haiku-4-5-20251001@thinking-on | first try | -9 pts [-20, +1] | 7 | 6 | 11 |
 | claude-haiku-4-5-20251001@thinking-on | after repair | -7 pts [-15, +1] | 5 | 10 | 9 |
 | claude-haiku-5-5@thinking-on | first try | +0 pts [-3, +3] | 2 | 20 | 2 |
 | claude-haiku-5-5@thinking-on | after repair | +0 pts [+0, +0] | 0 | 24 | 0 |
 | claude-opus-5-5@thinking-on | first try | -2 pts [-4, +0] | 0 | 22 | 2 |
 | claude-opus-5-5@thinking-on | after repair | +0 pts [+0, +0] | 0 | 24 | 0 |
-| claude-opus-5@thinking-off | first try | -10 pts [-20, -2] | 3 | 13 | 8 |
+| claude-opus-5@thinking-off | first try | -10 pts [-19, -2] | 3 | 13 | 8 |
 | claude-opus-5@thinking-off | after repair | -1 pts [-2, +0] | 0 | 23 | 1 |
 | claude-opus-5@thinking-on | first try | -1 pts [-2, +0] | 0 | 23 | 1 |
 | claude-opus-5@thinking-on | after repair | +0 pts [+0, +0] | 0 | 24 | 0 |
 | claude-sonnet-5-5@thinking-on | first try | -2 pts [-5, +2] | 1 | 20 | 3 |
 | claude-sonnet-5-5@thinking-on | after repair | -1 pts [-2, +0] | 0 | 23 | 1 |
-| claude-sonnet-5@thinking-off | first try | -2 pts [-15, +11] | 8 | 8 | 8 |
+| claude-sonnet-5@thinking-off | first try | -2 pts [-14, +10] | 8 | 8 | 8 |
 | claude-sonnet-5@thinking-off | after repair | +1 pts [-3, +5] | 4 | 17 | 3 |
 | claude-sonnet-5@thinking-on | first try | +1 pts [-6, +8] | 7 | 10 | 7 |
 | claude-sonnet-5@thinking-on | after repair | +0 pts [+0, +0] | 0 | 24 | 0 |
 | DeepSeek-V4-Flash | first try | -2 pts [-13, +9] | 7 | 10 | 7 |
-| DeepSeek-V4-Flash | after repair | -8 pts [-18, +3] | 6 | 6 | 12 |
+| DeepSeek-V4-Flash | after repair | -8 pts [-18, +2] | 6 | 6 | 12 |
 | Kimi-K3 | first try | +3 pts [-6, +13] | 10 | 5 | 9 |
 | Kimi-K3 | after repair | -2 pts [-4, +0] | 0 | 22 | 2 |
-| GLM-5.3-Flash | first try | +10 pts [+3, +17] | 12 | 10 | 2 |
-| GLM-5.3-Flash | after repair | +3 pts [-5, +11] | 10 | 7 | 7 |
+| GLM-5.3-Flash | first try | +10 pts [+2, +17] | 12 | 10 | 2 |
+| GLM-5.3-Flash | after repair | +3 pts [-4, +12] | 10 | 7 | 7 |
 
 ## Pass rate by level
 
@@ -92,8 +92,8 @@
 | 2mm | PolyBench | 0% / 10% | 5% / 35% | 45% / 80% | 100% / 100% | 100% / 100% | 35% / 100% | 95% / 100% | 100% / 100% | 60% / 95% | 95% / 100% | 0% / 30% | 90% / 100% | 10% / 80% |
 | gesummv | PolyBench | 0% / 5% | 20% / 65% | 40% / 85% | 90% / 100% | 95% / 100% | 100% / 100% | 100% / 100% | 95% / 100% | 5% / 100% | 95% / 100% | 5% / 25% | 85% / 100% | 15% / 60% |
 | gemver | PolyBench | 0% / 5% | 5% / 60% | 30% / 90% | 100% / 100% | 100% / 100% | 60% / 95% | 100% / 100% | 100% / 100% | 50% / 95% | 100% / 100% | 0% / 15% | 90% / 100% | 15% / 90% |
-| 3mm | PolyBench | 0% / 0% | 0% / 60% | 45% / 95% | 100% / 100% | 100% / 100% | 60% / 100% | 95% / 100% | 100% / 100% | 50% / 85% | 90% / 100% | 0% / 10% | 80% / 100% | 35% / 90% |
 | heat3d | PolyBench | 0% / 5% | 0% / 40% | 60% / 90% | 100% / 100% | 100% / 100% | 45% / 100% | 100% / 100% | 95% / 100% | 50% / 90% | 100% / 100% | 0% / 15% | 90% / 100% | 15% / 85% |
+| 3mm | PolyBench | 0% / 0% | 0% / 60% | 45% / 95% | 100% / 100% | 100% / 100% | 60% / 100% | 95% / 100% | 100% / 100% | 50% / 85% | 90% / 100% | 0% / 10% | 80% / 100% | 35% / 90% |
 | bicg | PolyBench | 0% / 20% | 5% / 75% | 25% / 95% | 95% / 100% | 100% / 100% | 90% / 100% | 95% / 100% | 100% / 100% | 55% / 100% | 95% / 100% | 15% / 60% | 85% / 100% | 20% / 85% |
 | trmm | PolyBench | 0% / 25% | 10% / 45% | 60% / 90% | 90% / 100% | 85% / 100% | 90% / 100% | 95% / 100% | 90% / 90% | 50% / 100% | 100% / 100% | 10% / 45% | 85% / 100% | 15% / 80% |
 | jacobi2d | PolyBench | 0% / 5% | 15% / 65% | 75% / 100% | 90% / 95% | 100% / 100% | 85% / 100% | 100% / 100% | 95% / 100% | 30% / 90% | 90% / 100% | 0% / 35% | 95% / 100% | 20% / 95% |
